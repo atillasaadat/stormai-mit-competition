@@ -152,26 +152,29 @@ def forecast(model, input_sequence, device):
     return output.squeeze(0).cpu().numpy()
 
 #############################################
-# 4. Plotting functions for model performance
+# 4. Plotting functions for combined historical & forecast plots
 #############################################
-def plot_forecast_ap_index(pred, actual, title="Forecast vs Actual for ap_index_nT"):
-    plt.figure(figsize=(10, 5))
-    plt.plot(actual, label="Actual ap_index_nT", marker='o')
-    plt.plot(pred, label="Predicted ap_index_nT", marker='x')
+def plot_combined_forecast(history_timestamps, history_values, forecast_timestamps, forecast_values, 
+                           ylabel, title):
+    """
+    Plot a combined time series showing historical data and forecasted values.
+    Args:
+        history_timestamps (array-like): Timestamps for historical data.
+        history_values (array-like): Historical target values.
+        forecast_timestamps (array-like): Timestamps for forecasted data.
+        forecast_values (array-like): Forecasted target values.
+        ylabel (str): Label for the Y-axis.
+        title (str): Plot title.
+    """
+    plt.figure(figsize=(12, 6))
+    plt.plot(history_timestamps, history_values, label="Historical", marker='o')
+    plt.plot(forecast_timestamps, forecast_values, label="Forecast", marker='x')
+    plt.xlabel("Timestamp")
+    plt.ylabel(ylabel)
     plt.title(title)
-    plt.xlabel("Time step")
-    plt.ylabel("ap_index_nT")
+    plt.xticks(rotation=45)
     plt.legend()
-    plt.show()
-
-def plot_forecast_f107_index(pred, actual, title="Forecast vs Actual for f10.7_index"):
-    plt.figure(figsize=(10, 5))
-    plt.plot(actual, label="Actual f10.7_index", marker='o')
-    plt.plot(pred, label="Predicted f10.7_index", marker='x')
-    plt.title(title)
-    plt.xlabel("Time step")
-    plt.ylabel("f10.7_index")
-    plt.legend()
+    plt.tight_layout()
     plt.show()
 
 #############################################
@@ -251,23 +254,21 @@ def main():
     # Use all numeric columns (except Timestamp) as input;
     # only predict ap_index_nT and f10.7_index.
     # ---------------------------
-    # (Adjust this list if you want to filter out undesired features.)
     all_features = [col for col in omni_df.columns if col != 'Timestamp']
     target_features = ["ap_index_nT", "f10.7_index"]
-    # Option 1: Use all features (including targets) as input.
-    # Option 2: Use only non-target columns as input.
-    # Here we choose Option 2 to emphasize the influence of the other columns.
     input_features = [f for f in all_features if f not in target_features]
 
     # Create input (X) and target (Y) arrays.
     X = omni_df[input_features].values  # shape: (n_timesteps, n_input_features)
-    Y = omni_df[target_features].values  # shape: (n_timesteps, n_target_features)
+    Y = omni_df[target_features].values   # shape: (n_timesteps, n_target_features)
 
     # ---------------------------
     # Define forecasting parameters.
     # ---------------------------
-    input_window = 100                    # number of past timesteps to use
-    forecast_horizon = len(sat_density_df) # forecast horizon set to # of sat_density timestamps
+    input_window = 100  # Define the input window length (e.g., 100 timesteps)
+    # Use unique timestamps from sat_density for forecast alignment.
+    unique_timestamps = sat_density_df["Timestamp"].drop_duplicates().reset_index(drop=True)
+    forecast_horizon = len(unique_timestamps)  # one prediction per unique timestamp
 
     # Split into training and validation sets (80/20 split).
     split_idx = int(0.8 * len(X))
@@ -287,8 +288,6 @@ def main():
     # ---------------------------
     # Define and instantiate the model.
     # ---------------------------
-    # input_size: number of input features,
-    # target_size: number of target features (2 in our case).
     patch_size = 10    # timesteps per patch
     d_model = 64
     n_heads = 4
@@ -308,31 +307,36 @@ def main():
 
     # ---------------------------
     # Forecast using the last input_window from the full series.
-    # Also extract the corresponding ground truth targets.
     # ---------------------------
     input_sequence = X[-input_window:]
     forecasted_values = forecast(model, input_sequence, device)  # shape: (forecast_horizon, n_target_features)
     true_values = Y[-forecast_horizon:]  # ground truth for target features
 
-    # Save the forecasted data (aligned to sat_density timestamps).
+    # Save the forecasted data (aligned to unique sat_density timestamps).
     forecast_df = pd.DataFrame(forecasted_values, columns=target_features)
-    forecast_df["Timestamp"] = sat_density_df["Timestamp"].values[:forecast_horizon]
+    forecast_df["Timestamp"] = unique_timestamps
     forecast_file = forcasted_omni2_data_folder / "forecasted_omni.csv"
     forecast_df.to_csv(forecast_file, index=False)
     print(f"Forecasted data saved to {forecast_file}")
 
     # ---------------------------
-    # Plotting results (using a subset of the forecast horizon for clarity).
+    # Plot combined historical and forecasted results.
     # ---------------------------
-    plot_horizon = min(100, forecast_horizon)
-    # For ap_index_nT (target column index 0)
-    pred_ap = forecasted_values[:plot_horizon, 0]
-    true_ap = true_values[:plot_horizon, 0]
-    plot_forecast_ap_index(pred_ap, true_ap)
-    # For f10.7_index (target column index 1)
-    pred_f107 = forecasted_values[:plot_horizon, 1]
-    true_f107 = true_values[:plot_horizon, 1]
-    plot_forecast_f107_index(pred_f107, true_f107)
+    # For the historical data, we use the last `input_window` points from the OMNI data.
+    history_timestamps = omni_df['Timestamp'].iloc[-input_window:]
+    history_ap = omni_df['ap_index_nT'].iloc[-input_window:]
+    history_f107 = omni_df['f10.7_index'].iloc[-input_window:]
+
+    # Forecast timestamps are the unique timestamps from the sat_density file.
+    forecast_timestamps = unique_timestamps
+
+    # Plot combined forecast for ap_index_nT.
+    plot_combined_forecast(history_timestamps, history_ap, forecast_timestamps, forecasted_values[:, 0],
+                           ylabel="ap_index_nT", title="Historical and Forecasted ap_index_nT")
+
+    # Plot combined forecast for f10.7_index.
+    plot_combined_forecast(history_timestamps, history_f107, forecast_timestamps, forecasted_values[:, 1],
+                           ylabel="f10.7_index", title="Historical and Forecasted f10.7_index")
 
 if __name__ == "__main__":
     main()
