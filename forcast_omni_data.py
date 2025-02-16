@@ -1,3 +1,5 @@
+import argparse
+import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -6,6 +8,14 @@ import torch.nn as nn
 import torch.utils.data as data
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import matplotlib.pyplot as plt
+from tqdm import tqdm  # Ensure you have tqdm installed
+
+# Set up logging with a default INFO level.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 #############################################
 # 1. Define the PatchTST-inspired model
@@ -38,12 +48,13 @@ class PatchTST(nn.Module):
         self.forecast_horizon = forecast_horizon  # store for reshaping
         self.target_size = target_size            # store for reshaping
 
+        logger.debug("Initializing PatchTST model.")
         # Patchify the time series along the time axis.
         self.proj = nn.Conv1d(in_channels=input_size, out_channels=d_model,
                               kernel_size=patch_size, stride=patch_size)
 
-        # Transformer encoder layers.
-        encoder_layers = TransformerEncoderLayer(d_model, n_heads, d_model * 4, dropout)
+        # Use batch_first=True for the Transformer layers.
+        encoder_layers = TransformerEncoderLayer(d_model, n_heads, d_model * 4, dropout, batch_first=True)
         self.transformer_encoder = TransformerEncoder(encoder_layers, n_layers)
 
         # Forecast head outputs forecast_horizon steps for each target feature.
@@ -59,16 +70,13 @@ class PatchTST(nn.Module):
         batch_size = x.size(0)
         # Conv1d expects (batch, input_size, seq_len)
         x = x.transpose(1, 2)
-        x = self.proj(x)  # -> (batch, d_model, new_seq_len)
-        x = x.transpose(1, 2)  # -> (batch, new_seq_len, d_model)
-        # Transformer expects (sequence, batch, features)
-        x = x.transpose(0, 1)  # -> (new_seq_len, batch, d_model)
+        x = self.proj(x)       # (batch, d_model, new_seq_len)
+        x = x.transpose(1, 2)  # (batch, new_seq_len, d_model)
+        # With batch_first=True, transformer expects (batch, seq_len, d_model)
         x = self.transformer_encoder(x)
-        x = x.transpose(0, 1)  # -> (batch, new_seq_len, d_model)
-        # Use the last patch’s representation as a summary.
-        x_last = x[:, -1, :]  # -> (batch, d_model)
-        out = self.fc(x_last)  # -> (batch, forecast_horizon * target_size)
-        # Reshape to (batch, forecast_horizon, target_size)
+        # Use the last patch's representation
+        x_last = x[:, -1, :]
+        out = self.fc(x_last)
         out = out.view(batch_size, self.forecast_horizon, self.target_size)
         return out
 
@@ -95,6 +103,7 @@ class TimeSeriesDataset(data.Dataset):
         self.input_window = input_window
         self.forecast_horizon = forecast_horizon
         self.length = len(X) - input_window - forecast_horizon + 1
+        logger.debug(f"TimeSeriesDataset initialized with {self.length} samples.")
 
     def __len__(self):
         return self.length
@@ -105,37 +114,83 @@ class TimeSeriesDataset(data.Dataset):
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
 #############################################
-# 3. Training and forecasting functions
+# 3. Training, evaluation, and forecasting functions
 #############################################
 def train_model(model, train_loader, val_loader, epochs, lr, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     model.to(device)
+    logger.info("Starting training loop.")
+    
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-        for x, y in train_loader:
+        train_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                          desc=f"Epoch {epoch+1}/{epochs} Training", unit="batch")
+        for batch_idx, (x, y) in train_pbar:
+            # Check for NaNs in inputs
+            if torch.isnan(x).any():
+                logger.error(f"Input batch contains NaNs. Batch {batch_idx} at epoch {epoch+1}")
+            if torch.isnan(y).any():
+                logger.error(f"Target batch contains NaNs. Batch {batch_idx} at epoch {epoch+1}")
+
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             output = model(x)
             loss = criterion(output, y)
+            if torch.isnan(loss):
+                logger.error(f"Loss is NaN at epoch {epoch+1}, batch {batch_idx}. Aborting training.")
+                return
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * x.size(0)
+            train_pbar.set_postfix(loss=f"{loss.item():.6f}")
+        
         train_loss /= len(train_loader.dataset)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.6f}")
+        logger.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.6f}")
 
-        # Validation
         model.eval()
         val_loss = 0.0
+        val_pbar = tqdm(enumerate(val_loader), total=len(val_loader),
+                        desc=f"Epoch {epoch+1}/{epochs} Validation", unit="batch")
         with torch.no_grad():
-            for x, y in val_loader:
+            for batch_idx, (x, y) in val_pbar:
                 x, y = x.to(device), y.to(device)
                 output = model(x)
                 loss = criterion(output, y)
                 val_loss += loss.item() * x.size(0)
+                val_pbar.set_postfix(loss=f"{loss.item():.6f}")
         val_loss /= len(val_loader.dataset)
-        print(f"Epoch {epoch+1}/{epochs}, Val Loss: {val_loss:.6f}")
+        logger.info(f"Epoch {epoch+1}/{epochs}, Val Loss: {val_loss:.6f}")
+
+def evaluate_model(model, test_loader, device):
+    """
+    Evaluate the model on the test set and compute MSE and MAE.
+    Returns:
+        mse_avg, mae_avg, all_preds, all_trues
+    """
+    model.eval()
+    mse_sum = 0.0
+    mae_sum = 0.0
+    total_elements = 0
+    all_preds = []
+    all_trues = []
+    criterion = nn.MSELoss(reduction='sum')
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
+            all_preds.append(preds.cpu())
+            all_trues.append(y.cpu())
+            mse_sum += criterion(preds, y).item()
+            mae_sum += torch.sum(torch.abs(preds - y)).item()
+            total_elements += y.numel()
+    mse_avg = mse_sum / total_elements
+    mae_avg = mae_sum / total_elements
+    all_preds = torch.cat(all_preds, dim=0)
+    all_trues = torch.cat(all_trues, dim=0)
+    logger.info(f"Evaluation complete: MSE={mse_avg:.6f}, MAE={mae_avg:.6f}")
+    return mse_avg, mae_avg, all_preds, all_trues
 
 def forecast(model, input_sequence, device):
     """
@@ -155,9 +210,10 @@ def forecast(model, input_sequence, device):
 # 4. Plotting functions for combined historical & forecast plots
 #############################################
 def plot_combined_forecast(history_timestamps, history_values, forecast_timestamps, forecast_values, 
-                           ylabel, title):
+                           ylabel, title, true_forecast=None):
     """
     Plot a combined time series showing historical data and forecasted values.
+    Optionally, also plot true forecast values.
     Args:
         history_timestamps (array-like): Timestamps for historical data.
         history_values (array-like): Historical target values.
@@ -165,10 +221,14 @@ def plot_combined_forecast(history_timestamps, history_values, forecast_timestam
         forecast_values (array-like): Forecasted target values.
         ylabel (str): Label for the Y-axis.
         title (str): Plot title.
+        true_forecast (array-like, optional): True forecast values.
     """
+    logger.debug("Plotting combined forecast.")
     plt.figure(figsize=(12, 6))
-    plt.plot(history_timestamps, history_values, label="Historical", marker='o')
-    plt.plot(forecast_timestamps, forecast_values, label="Forecast", marker='x')
+    plt.plot(history_timestamps, history_values, label="Historical", marker='o', color='blue')
+    plt.plot(forecast_timestamps, forecast_values, label="Forecast", marker='x', color='red')
+    if true_forecast is not None:
+        plt.plot(forecast_timestamps, true_forecast, label="True Forecast", marker='o', linestyle='--', color='green')
     plt.xlabel("Timestamp")
     plt.ylabel(ylabel)
     plt.title(title)
@@ -195,11 +255,13 @@ class DataHandler():
                 df = pd.read_csv(file)
                 all_dataframes.append(df)
         self.initial_states = pd.concat(all_dataframes, ignore_index=True)
+        logger.info(f"Loaded initial state data with {len(self.initial_states)} rows.")
 
     def read_omni_data(self, file_id):
         file_id_str = f"{file_id:05d}"
         for file in self.omni_folder.iterdir():
             if file.suffix == '.csv' and file_id_str in file.stem:
+                logger.debug(f"Reading OMNI file for File ID {file_id}.")
                 return pd.read_csv(file)
         raise FileNotFoundError(f"File with ID {file_id} not found in {self.omni_folder}")
 
@@ -207,13 +269,15 @@ class DataHandler():
         file_id_str = f"{file_id:05d}"
         for file in self.sat_density_folder.iterdir():
             if file.suffix == '.csv' and file_id_str in file.stem:
+                logger.debug(f"Reading Sat density file for File ID {file_id}.")
                 return pd.read_csv(file)
         raise FileNotFoundError(f"File with ID {file_id} not found in {self.sat_density_folder}")
 
 #############################################
-# 6. Main training and forecasting pipeline
+# 6. Main training, evaluation, and forecasting pipeline
 #############################################
 def main():
+    logger.info("Starting main pipeline.")
     # Set up folder paths (adjust as needed)
     omni_folder = Path("./data/omni2")
     initial_state_folder = Path("./data/initial_state")
@@ -226,10 +290,19 @@ def main():
     # ---------------------------
     # Load all files based on initial_states File ID.
     # ---------------------------
+    load_percentage = 0.01  # For testing, load only 10% of file IDs.
     file_ids = data_handler.initial_states["File ID"].unique()
+    logger.info(f"Total file IDs available: {len(file_ids)}")
+    if load_percentage < 1.0:
+        file_ids = np.random.choice(file_ids, size=int(load_percentage * len(file_ids)), replace=False)
+        logger.info(f"Randomly selected {len(file_ids)} file IDs ({load_percentage*100:.0f}%) for loading.")
+
     omni_dfs = []
     sat_density_dfs = []
-    for fid in file_ids:
+    total_ids = len(file_ids)
+    next_threshold = 0.05  # 5% increments
+
+    for i, fid in enumerate(file_ids):
         try:
             omni_dfs.append(data_handler.read_omni_data(fid))
         except FileNotFoundError:
@@ -238,52 +311,101 @@ def main():
             sat_density_dfs.append(data_handler.read_sat_density_data(fid))
         except FileNotFoundError:
             print(f"Sat density file for File ID {fid} not found; skipping.")
+
+        progress = (i + 1) / total_ids
+        if progress >= next_threshold:
+            print(f"{int(next_threshold * 100)}% complete")
+            next_threshold += 0.05
+
     if len(omni_dfs) == 0 or len(sat_density_dfs) == 0:
         raise ValueError("No valid OMNI or sat_density files were loaded.")
     omni_df = pd.concat(omni_dfs, ignore_index=True)
     sat_density_df = pd.concat(sat_density_dfs, ignore_index=True)
+    logger.info(f"Loaded {len(omni_df)} rows of OMNI data and {len(sat_density_df)} rows of sat density data.")
 
     # Preprocess: convert Timestamps and sort.
     omni_df['Timestamp'] = pd.to_datetime(omni_df['Timestamp'])
     omni_df.sort_values('Timestamp', inplace=True)
     sat_density_df['Timestamp'] = pd.to_datetime(sat_density_df['Timestamp'])
     sat_density_df.sort_values('Timestamp', inplace=True)
+    logger.debug("Timestamps converted and sorted.")
 
     # ---------------------------
     # Define input and target features.
-    # Use all numeric columns (except Timestamp) as input;
-    # only predict ap_index_nT and f10.7_index.
-    # ---------------------------
-    all_features = [col for col in omni_df.columns if col != 'Timestamp']
+    # Only select suggested features.
+    # Suggested for "ap_index_nT":
+    ap_features = [
+        "Kp_index", "Dst_index_nT", "AU_index_nT", "AL_index_nT", "AE_index_nT",
+        "SW_Plasma_Speed_km_s", "SW_Proton_Density_N_cm3", "SW_Plasma_Temperature_K",
+        "Scalar_B_nT", "Vector_B_Magnitude_nT", "BX_nT_GSE_GSM", "BY_nT_GSE", "BZ_nT_GSE",
+        "Plasma_Beta", "Flow_pressure"
+    ]
+    # Suggested for "f10.7_index":
+    f107_features = [
+        "Bartels_rotation_number", "R_Sunspot_No", "Lyman_alpha"
+    ]
+    candidate_features = list(set(ap_features).union(set(f107_features)))
+    candidate_features = [f for f in candidate_features if f in omni_df.columns]
+
+    # Remove features that are all NaN or constant.
+    cleaned_features = []
+    for f in candidate_features:
+        if omni_df[f].isna().all():
+            logger.debug(f"Feature {f} is all NaN, removing.")
+            continue
+        if omni_df[f].nunique() <= 1:
+            logger.debug(f"Feature {f} is constant, removing.")
+            continue
+        cleaned_features.append(f)
+
+    input_features = cleaned_features
     target_features = ["ap_index_nT", "f10.7_index"]
-    input_features = [f for f in all_features if f not in target_features]
+
+    logger.info(f"Selected input features: {input_features}")
+    logger.info(f"Target features: {target_features}")
+
+    # Fill any remaining NaN values in input features with their median.
+    for col in input_features:
+        if omni_df[col].isna().any():
+            median_val = omni_df[col].median()
+            logger.debug(f"Filling NaNs in {col} with median value {median_val}.")
+            omni_df[col] = omni_df[col].fillna(median_val)
+
+    # Normalize the input features.
+    input_data = omni_df[input_features]
+    input_data = (input_data - input_data.mean()) / input_data.std()
+    omni_df[input_features] = input_data
 
     # Create input (X) and target (Y) arrays.
     X = omni_df[input_features].values  # shape: (n_timesteps, n_input_features)
     Y = omni_df[target_features].values   # shape: (n_timesteps, n_target_features)
+    logger.info(f"Input features shape: {X.shape}, Target features shape: {Y.shape}")
 
     # ---------------------------
     # Define forecasting parameters.
     # ---------------------------
-    input_window = 100  # Define the input window length (e.g., 100 timesteps)
-    # Use unique timestamps from sat_density for forecast alignment.
+    input_window = 100  # e.g., 100 timesteps of historical data
     unique_timestamps = sat_density_df["Timestamp"].drop_duplicates().reset_index(drop=True)
     forecast_horizon = len(unique_timestamps)  # one prediction per unique timestamp
+    logger.info(f"Using input_window={input_window} and forecast_horizon={forecast_horizon}")
 
-    # Split into training and validation sets (80/20 split).
+    # ---------------------------
+    # Train–Test (80/20) split.
+    # ---------------------------
     split_idx = int(0.8 * len(X))
+    logger.info(f"Train/Test split at index {split_idx} out of {len(X)} samples.")
     train_X = X[:split_idx]
     train_Y = Y[:split_idx]
-    # Ensure the validation set has enough context.
-    val_X = X[split_idx - input_window - forecast_horizon + 1:]
-    val_Y = Y[split_idx - input_window - forecast_horizon + 1:]
+    test_X = X[split_idx - input_window - forecast_horizon + 1:]
+    test_Y = Y[split_idx - input_window - forecast_horizon + 1:]
 
     # Create datasets and loaders.
-    train_dataset = TimeSeriesDataset(train_X, train_Y, input_window, forecast_horizon)
-    val_dataset = TimeSeriesDataset(val_X, val_Y, input_window, forecast_horizon)
     batch_size = 32
+    train_dataset = TimeSeriesDataset(train_X, train_Y, input_window, forecast_horizon)
+    test_dataset = TimeSeriesDataset(test_X, test_Y, input_window, forecast_horizon)
     train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    logger.info(f"Train dataset length: {len(train_dataset)}, Test dataset length: {len(test_dataset)}")
 
     # ---------------------------
     # Define and instantiate the model.
@@ -297,46 +419,75 @@ def main():
                      d_model=d_model, n_heads=n_heads, n_layers=n_layers, 
                      forecast_horizon=forecast_horizon, target_size=len(target_features), 
                      dropout=dropout)
+    logger.debug("Model instantiated.")
 
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        logger.info("Cuda available: %s", torch.cuda.is_available())
+    else:
+        raise ValueError("Cuda not available")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     epochs = 10  # Increase for full training.
     lr = 1e-3
 
-    print("Starting training...")
-    train_model(model, train_loader, val_loader, epochs, lr, device)
+    logger.info("Starting training...")
+    train_model(model, train_loader, test_loader, epochs, lr, device)
 
     # ---------------------------
-    # Forecast using the last input_window from the full series.
+    # Evaluate the model on the test set and print metrics.
     # ---------------------------
-    input_sequence = X[-input_window:]
-    forecasted_values = forecast(model, input_sequence, device)  # shape: (forecast_horizon, n_target_features)
-    true_values = Y[-forecast_horizon:]  # ground truth for target features
-
-    # Save the forecasted data (aligned to unique sat_density timestamps).
-    forecast_df = pd.DataFrame(forecasted_values, columns=target_features)
-    forecast_df["Timestamp"] = unique_timestamps
-    forecast_file = forcasted_omni2_data_folder / "forecasted_omni.csv"
-    forecast_df.to_csv(forecast_file, index=False)
-    print(f"Forecasted data saved to {forecast_file}")
+    test_mse, test_mae, preds, trues = evaluate_model(model, test_loader, device)
+    logger.info(f"Test MSE: {test_mse:.6f}, Test MAE: {test_mae:.6f}")
 
     # ---------------------------
-    # Plot combined historical and forecasted results.
+    # Forecast using the last input_window from the test set.
+    # Map the test sample back to the original omni_df indices.
     # ---------------------------
-    # For the historical data, we use the last `input_window` points from the OMNI data.
-    history_timestamps = omni_df['Timestamp'].iloc[-input_window:]
-    history_ap = omni_df['ap_index_nT'].iloc[-input_window:]
-    history_f107 = omni_df['f10.7_index'].iloc[-input_window:]
+    test_offset = split_idx - input_window - forecast_horizon + 1
+    sample_index = 0  # choose the first test sample (change as needed)
+    global_index = test_offset + sample_index
+    logger.debug(f"Using global index {global_index} for forecast sample.")
 
-    # Forecast timestamps are the unique timestamps from the sat_density file.
-    forecast_timestamps = unique_timestamps
+    # Extract historical data and true forecast values, converting to NumPy arrays.
+    history_timestamps = omni_df['Timestamp'].iloc[global_index : global_index + input_window].values
+    history_ap = omni_df['ap_index_nT'].iloc[global_index : global_index + input_window].values
+    history_f107 = omni_df['f10.7_index'].iloc[global_index : global_index + input_window].values
 
-    # Plot combined forecast for ap_index_nT.
-    plot_combined_forecast(history_timestamps, history_ap, forecast_timestamps, forecasted_values[:, 0],
-                           ylabel="ap_index_nT", title="Historical and Forecasted ap_index_nT")
+    forecast_timestamps = omni_df['Timestamp'].iloc[global_index + input_window : global_index + input_window + forecast_horizon].values
+    true_forecast_ap = omni_df['ap_index_nT'].iloc[global_index + input_window : global_index + input_window + forecast_horizon].values
+    true_forecast_f107 = omni_df['f10.7_index'].iloc[global_index + input_window : global_index + input_window + forecast_horizon].values
 
-    # Plot combined forecast for f10.7_index.
-    plot_combined_forecast(history_timestamps, history_f107, forecast_timestamps, forecasted_values[:, 1],
-                           ylabel="f10.7_index", title="Historical and Forecasted f10.7_index")
+    sample_x, _ = test_dataset[sample_index]
+    sample_x = sample_x.unsqueeze(0).to(device)
+    pred_sample = model(sample_x).cpu().numpy().squeeze(0)  # shape: (forecast_horizon, target_size)
+    pred_ap = pred_sample[:, 0]
+    pred_f107 = pred_sample[:, 1]
+    logger.info("Forecast sample computed.")
+
+    # ---------------------------
+    # Plot combined timeseries for ap_index_nT.
+    # ---------------------------
+    plot_combined_forecast(history_timestamps, history_ap, forecast_timestamps, pred_ap,
+                           ylabel="ap_index_nT", title="Historical and Forecasted ap_index_nT",
+                           true_forecast=true_forecast_ap)
+    # ---------------------------
+    # Plot combined timeseries for f10.7_index.
+    # ---------------------------
+    plot_combined_forecast(history_timestamps, history_f107, forecast_timestamps, pred_f107,
+                           ylabel="f10.7_index", title="Historical and Forecasted f10.7_index",
+                           true_forecast=true_forecast_f107)
+    logger.info("Plots generated.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train and forecast space weather indices with PatchTST.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled.")
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+        logger.info("Debug logging disabled; using INFO level logging.")
+
     main()
