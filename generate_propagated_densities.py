@@ -1,263 +1,236 @@
-# | default_exp atm
-import pandas as pd
-import numpy as np
+"""
+Refactored orbit propagation and MSIS persistence simulation.
+This code uses Orekit for high-fidelity orbit propagation and a custom
+MSIS persistence atmosphere model. It is organized in an object-oriented
+manner so that multiple file IDs can be processed.
+"""
+
 import math
+import time
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 from pymsis import msis
-#import dill
 
 # Orekit imports
 import orekit
-from org.orekit.time import AbsoluteDate
-from org.orekit.utils import PVCoordinates, Constants
-from org.orekit.frames import Frame
-from org.orekit.models.earth.atmosphere import PythonAtmosphere
-from org.hipparchus.geometry.euclidean.threed import Vector3D
-from org.orekit.frames import FramesFactory, Frame
-from org.orekit.bodies import CelestialBodyFactory, OneAxisEllipsoid
-from org.orekit.utils import IERSConventions
-from org.orekit.time import TimeScalesFactory
-
-import orekit
-from orekit.pyhelpers import setup_orekit_curdir, absolutedate_to_datetime
-
-from org.orekit.orbits import KeplerianOrbit, EquinoctialOrbit, PositionAngleType, OrbitType, CartesianOrbit
-from org.orekit.frames import FramesFactory, LOFType, Frame
+from orekit.pyhelpers import (
+    setup_orekit_curdir,
+    absolutedate_to_datetime,
+    datetime_to_absolutedate,
+)
 from org.orekit.time import AbsoluteDate, TimeScalesFactory
-from org.orekit.utils import Constants, PVCoordinates
+from org.orekit.frames import FramesFactory, Frame
+from org.orekit.models.earth.atmosphere import PythonAtmosphere
+from org.orekit.bodies import CelestialBodyFactory, OneAxisEllipsoid, CelestialBody
+from org.orekit.utils import Constants, PVCoordinates, IERSConventions
+from org.orekit.orbits import KeplerianOrbit, PositionAngleType
 from org.orekit.propagation.numerical import NumericalPropagator
 from org.hipparchus.ode.nonstiff import DormandPrince853Integrator
 from org.orekit.propagation import SpacecraftState
-from org.orekit.bodies import OneAxisEllipsoid, CelestialBodyFactory, CelestialBody
-from org.orekit.utils import IERSConventions
 from org.orekit.forces.gravity.potential import GravityFieldFactory
-from org.orekit.forces.gravity import HolmesFeatherstoneAttractionModel, ThirdBodyAttraction, OceanTides, SolidTides
-from orekit import JArray_double, JArray
-from java.util import ArrayList
-
-from org.orekit.forces.radiation import SolarRadiationPressure, IsotropicRadiationSingleCoefficient, RadiationSensitive
-from org.orekit.models.earth.atmosphere.data import CssiSpaceWeatherData, JB2008SpaceEnvironmentData
+from org.orekit.forces.gravity import HolmesFeatherstoneAttractionModel, ThirdBodyAttraction
+from org.orekit.forces.gravity import SolidTides
+from org.orekit.forces.radiation import SolarRadiationPressure, IsotropicRadiationSingleCoefficient
 from org.orekit.forces.drag import IsotropicDrag, DragForce
-from org.orekit.models.earth.atmosphere import DTM2000, HarrisPriester, JB2008, NRLMSISE00, Atmosphere, SimpleExponentialAtmosphere, PythonAtmosphere
-from orekit.pyhelpers import datetime_to_absolutedate
-
+from orekit import JArray_double
+from java.util import ArrayList
 from org.hipparchus.geometry.euclidean.threed import Vector3D
+from math import radians
 
-from math import radians, degrees, pi
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import animation
-import time
-import matplotlib.ticker as ticker
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-from IPython import embed
-
-
-# Initialize Orekit JVM
-vm = orekit.initVM()
-from orekit.pyhelpers import setup_orekit_curdir
+# Initialize the Orekit JVM
+orekit.initVM()
 setup_orekit_curdir()
 
-def prop_orbit(initial_orbit, duration, step, CustomAtmosphereClass):
+
+# =============================================================================
+# Orbit Propagation Class
+# =============================================================================
+class OrbitPropagator:
     """
-    Propagates the orbit of a satellite over a given duration using a high-fidelity numerical propagator.
-    Parameters:
-    initial_orbit (Orbit): The initial orbit of the satellite.
-    duration (float): The duration for which to propagate the orbit, in seconds.
-    CustomAtmosphereClass (class): A custom atmosphere model class to be used for drag force calculations.
-    Returns:
-    tuple: A tuple containing:
-        - states (list of SpacecraftState): The list of spacecraft states at each propagation step.
-        - densities (list of float): The list of atmospheric densities at each spacecraft state.
-    The function performs the following steps:
-    1. Initializes the orbit parameters and spacecraft properties.
-    2. Sets up the time span for propagation.
-    3. Configures the numerical integrator and propagator.
-    4. Adds force models to the propagator.
-    5. Propagates the orbit over the specified duration.
-    7. Plots the satellite trajectory in 3D.
-    8. Computes atmospheric densities at each propagated state.
+    Propagates a given orbit using Orekit's numerical propagator.
+    It uses a custom atmospheric model (e.g. MSISPersistenceAtmosphere)
+    for drag force calculations.
     """
 
-    dur = duration # propagation duration time [s]
-    satellite_mass = 260.0
-    crossSection = 3.2 * 1.6 # m^2
-    srpArea = 30.0 # m^2
-
-    degree = 70
-    torder = 70
-    dragCoeff = 2.2
-    cr = 1.0
-
-    initialDate = initial_orbit.getDate()
-    #tspan = [initialDate.shiftedBy(float(dt)) for dt in np.linspace(0, duration, int(duration / step))]
-    # Assuming omni2_data is your DataFrame
-    # Assuming omni2_data is your DataFrame
-    timestamp_series = pd.to_datetime(omni2_data["Timestamp"])  # Convert column to pandas datetime
-
-    # Convert each timestamp to an Orekit AbsoluteDate
-    tspan = [datetime_to_absolutedate(ts.to_pydatetime()) for ts in timestamp_series]
-
-    minStep = 1e-6
-    maxstep = 100.0
-    initStep = 1.0
-    positionTolerance = 1e-4
-
-    sun = CelestialBodyFactory.getSun()
-    moon = CelestialBodyFactory.getMoon()
-
-    satmodel = IsotropicDrag(crossSection, dragCoeff) # Cross sectional area and the drag coefficient
-
-    initialOrbit = initial_orbit
-    orbitType = initialOrbit.getType()
-    initialState = SpacecraftState(initialOrbit, satellite_mass)
-    tol = NumericalPropagator.tolerances(positionTolerance, initialOrbit, orbitType)
-
-    integrator = DormandPrince853Integrator(minStep, maxstep, JArray_double.cast_(tol[0]), JArray_double.cast_(tol[1]))
-    integrator.setInitialStepSize(initStep)
-
-    propagator_num = NumericalPropagator(integrator)
-    propagator_num.setOrbitType(orbitType)
-    propagator_num.setInitialState(initialState)
-
-    # Add Solar Radiation Pressure
-    spacecraft = IsotropicRadiationSingleCoefficient(srpArea, cr)
-    srpProvider = SolarRadiationPressure(sun, earth, spacecraft)
-    propagator_num.addForceModel(srpProvider)
-
-    # Add Gravity Force
-    gravityProvider = GravityFieldFactory.getConstantNormalizedProvider(degree, torder, initialDate)
-    gravityForce = HolmesFeatherstoneAttractionModel(earth.getBodyFrame(), gravityProvider)
-    propagator_num.addForceModel(gravityForce)
-
-    # Add Solid Tides
-    solidTidesBodies = ArrayList().of_(CelestialBody)
-    solidTidesBodies.add(sun)
-    solidTidesBodies.add(moon)
-    solidTidesBodies = solidTidesBodies.toArray()
-    solidTides = SolidTides(earth.getBodyFrame(), 
-                            gravityProvider.getAe(), gravityProvider.getMu(),
-                            gravityProvider.getTideSystem(), 
-                            IERSConventions.IERS_2010,
-                            TimeScalesFactory.getUT1(IERSConventions.IERS_2010, True), 
-                            solidTidesBodies)
-    propagator_num.addForceModel(solidTides)
-
-    # Add Third Body Attractions
-    propagator_num.addForceModel(ThirdBodyAttraction(sun))
-    propagator_num.addForceModel(ThirdBodyAttraction(moon)) 
-
-    # Add Custom Drag Force
-    atmosphere = CustomAtmosphereClass
-    dragForce = DragForce(CustomAtmosphereClass, satmodel)
-    propagator_num.addForceModel(dragForce)
-
-    print(f'WOWOWO, {CustomAtmosphereClass}')
-    #embed();quit();
-    states = [initialState]
-    tic = time.time()
-    states = [propagator_num.propagate(tt)  for tt in tspan]
-    toc = time.time()
-    
-
-    posvel = [state.getPVCoordinates() for state in states]
-    poss = [state.getPosition() for state in posvel]
-    vels = [state.getVelocity() for state in posvel]
-    px = [pos.getX() * 1e-3 for pos in poss]
-    py = [pos.getY() * 1e-3 for pos in poss]
-    pz = [pos.getZ() * 1e-3 for pos in poss]
-    vx = [vel.getX() * 1e-3 for vel in vels]
-    vy = [vel.getY() * 1e-3 for vel in vels]
-    vz = [vel.getZ() * 1e-3 for vel in vels]
-    stat_list = [dur, toc - tic, px[-1], py[-1], pz[-1], vx[-1], vy[-1], vz[-1], step]
-    print("Time interval [s]:", stat_list[0])
-    print("Time step [s]:", stat_list[8])
-    print("CPU time [s]:", stat_list[1])
-    print("Final Pos [km]:", np.linalg.norm([px[-1], py[-1], pz[-1]]))
-    print("Final Vel [km]:", np.linalg.norm([vx[-1], vy[-1], vz[-1]]))
-
-    # Plot the satellite trajectory
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(px, py, pz, label='Trajectory')
-    
-    # plot earth
-    phi = np.linspace(-np.pi, np.pi, 100)
-    theta = np.linspace(-np.pi/2, np.pi/2, 50)
-    X_Earth = r_Earth*1e-3 * np.outer(np.cos(phi), np.cos(theta)).T
-    Y_Earth = r_Earth*1e-3 * np.outer(np.sin(phi), np.cos(theta)).T
-    Z_Earth = r_Earth*1e-3 * np.outer(np.ones(np.size(phi)), np.sin(theta)).T
-    ax.plot_surface(X_Earth, Y_Earth, Z_Earth, cmap='binary', alpha=0.35, antialiased=False, zorder = 1)
-    
-    ax.set_xlabel('X [km]')
-    ax.set_ylabel('Y [km]')
-    ax.set_zlabel('Z [km]')
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_title('Satellite Trajectory')
-    ax.legend()
-    plt.show()
-
-    print('prop_done!!')
-    embed();quit()
-
-    densities = []
-    for state in states:
-        density = atmosphere.getDensity(state.getDate(), state.getPVCoordinates().getPosition(), state.getFrame())
-        densities.append(density)
-    
-    return states, densities
-
-class PersistenceMSIS():
-    def __init__(self, omni2_data):
+    def __init__(self, initial_orbit, propagation_step, custom_atmosphere):
         """
-        Initialize the Persistence Model.
+        Initialize the orbit propagator.
 
         Args:
-          - omni2_data (pd.DataFrame): OMNI2 data containing Ap, F10.7, and other parameters.
-
+            initial_orbit (KeplerianOrbit): The initial orbit.
+            propagation_step (float): Propagation step size in seconds.
+            custom_atmosphere (PythonAtmosphere): Custom atmosphere model.
         """
-        self.initial_date = None
-        self.omni2_data = omni2_data
+        self.initial_orbit = initial_orbit
+        self.step = propagation_step
+        self.atmosphere = custom_atmosphere
+
+    def propagate(self, forecasted_omni2_data):
+        """
+        Propagates the orbit and computes atmospheric density along the trajectory.
+
+        Args:
+            forecasted_omni2_data (pd.DataFrame): DataFrame used for the MSIS model.
+
+        Returns:
+            tuple: (timestamps, states, densities)
+        """
+        logger.info("Initializing orbit propagation.")
+
+        # Satellite and force model parameters
+        satellite_mass = 522.0  # kg
+        cross_section = 0.75  # m^2
+        srp_area = 0.75  # m^2
+        drag_coeff = 2.2
+        cr = 1.0
+
+        # Time span: use forecasted timestamps from the forecasted OMNI2 DataFrame
+        # (timestamps must be in pandas datetime format)
+        timestamp_series = pd.to_datetime(forecasted_omni2_data["Timestamp"])
+        tspan = [
+            datetime_to_absolutedate(ts.to_pydatetime()) for ts in timestamp_series
+        ]
+
+        # Integrator tolerances and step sizes
+        min_step = 1e-6
+        max_step = 100.0
+        init_step = 1.0
+        pos_tol = 1e-4
+
+        # Get central bodies
+        sun = CelestialBodyFactory.getSun()
+        moon = CelestialBodyFactory.getMoon()
+        # Earth for gravity and SRP
+        itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
+        r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS
+        earth = OneAxisEllipsoid(r_Earth, Constants.IERS2010_EARTH_FLATTENING, itrf)
+        mu = Constants.IERS2010_EARTH_MU
+
+        # Initial spacecraft state
+        initial_date = self.initial_orbit.getDate()
+        initial_state = SpacecraftState(self.initial_orbit, satellite_mass)
+        orbit_type = self.initial_orbit.getType()
+        tol = NumericalPropagator.tolerances(pos_tol, self.initial_orbit, orbit_type)
+
+        # Set up numerical integrator and propagator
+        integrator = DormandPrince853Integrator(
+            min_step, max_step, JArray_double.cast_(tol[0]), JArray_double.cast_(tol[1])
+        )
+        integrator.setInitialStepSize(init_step)
+        propagator = NumericalPropagator(integrator)
+        propagator.setOrbitType(orbit_type)
+        propagator.setInitialState(initial_state)
+
+        # --- Add force models ---
+        # 1. Solar Radiation Pressure
+        srp_model = IsotropicRadiationSingleCoefficient(srp_area, cr)
+        srp_provider = SolarRadiationPressure(sun, earth, srp_model)
+        propagator.addForceModel(srp_provider)
+
+        # 2. Gravity Force using Holmes-Featherstone model
+        gravity_provider = GravityFieldFactory.getConstantNormalizedProvider(70, 70, initial_date)
+        gravity_force = HolmesFeatherstoneAttractionModel(earth.getBodyFrame(), gravity_provider)
+        propagator.addForceModel(gravity_force)
+
+        # 3. Solid Tides
+        solid_tides_bodies = ArrayList().of_(CelestialBody)
+        solid_tides_bodies.add(sun)
+        solid_tides_bodies.add(moon)
+        solid_tides = SolidTides(
+            earth.getBodyFrame(),
+            gravity_provider.getAe(),
+            gravity_provider.getMu(),
+            gravity_provider.getTideSystem(),
+            IERSConventions.IERS_2010,
+            TimeScalesFactory.getUT1(IERSConventions.IERS_2010, True),
+            solid_tides_bodies.toArray(),
+        )
+        propagator.addForceModel(solid_tides)
+
+        # 4. Third Body Attractions (Sun and Moon)
+        propagator.addForceModel(ThirdBodyAttraction(sun))
+        propagator.addForceModel(ThirdBodyAttraction(moon))
+
+        # 5. Drag Force using custom atmospheric model
+        drag_model = IsotropicDrag(cross_section, drag_coeff)
+        drag_force = DragForce(self.atmosphere, drag_model)
+        propagator.addForceModel(drag_force)
+
+        # Propagate over the entire timespan
+        states = []
+        logger.info(f"Beginning orbit propagation over {len(tspan)} time steps.")
+        tic = time.time()
+        for idx, current_date in enumerate(tspan):
+            logger.debug(f"Propagating to {current_date} ({idx + 1}/{len(tspan)})")
+            state = propagator.propagate(current_date)
+            states.append(state)
+        toc = time.time()
+        logger.info(f"Propagation completed in {toc - tic:.3f} seconds.")
+
+        # Compute atmospheric densities for each propagated state
+        densities = []
+        for state in states:
+            density = self.atmosphere.getDensity(
+                state.getDate(), state.getPVCoordinates().getPosition(), state.getFrame()
+            )
+            densities.append(float(density))
+
+        # (Optional: trajectory plotting code could be added here)
+        return tspan, states, densities
+
+
+# =============================================================================
+# Persistence and MSIS Atmosphere Classes
+# =============================================================================
+class PersistenceMSIS:
+    """
+    Persistence model for MSIS. Combines forecasted and historical OMNI2 data
+    to drive the MSIS atmospheric model.
+    """
+
+    def __init__(self, forecasted_omni2_data, historical_omni_data):
+        """
+        Initialize the persistence model by combining historical and forecasted data.
+        """
+        self.forcasted_omni2_data = forecasted_omni2_data.copy()
+        self.hist_omni_data = historical_omni_data.copy()
+
+        combined = self.hist_omni_data[["Timestamp", "ap_index_nT", "f10.7_index"]].copy()
+        forecasted = self.forcasted_omni2_data[["Timestamp", "ap_index_nT_pred", "f10.7_index_pred"]].rename(
+            columns={"ap_index_nT_pred": "ap_index_nT", "f10.7_index_pred": "f10.7_index"}
+        )
+        combined["Timestamp"] = pd.to_datetime(combined["Timestamp"])
+        forecasted["Timestamp"] = pd.to_datetime(forecasted["Timestamp"])
+
+        self.omni2_data = pd.concat([combined, forecasted], ignore_index=True)
+        self.omni2_data = self.omni2_data.sort_values(by="Timestamp").reset_index(drop=True)
+        self.omni2_data["Timestamp"] = pd.to_datetime(self.omni2_data["Timestamp"])
 
     def run(self, dt, lon, lat, alt):
         """
-        Runs the MSIS model for the initial date using OMNI2 data to avoid online calls.
-
-        Parameters:
-            datetime_input (datetime): Datetime for the simulation.
-            lon (float): Longitude in degrees.
-            lat (float): Latitude in degrees.
-            alt (float): Altitude in km.
-
-        Returns:
-            np.ndarray: Output from the MSIS model.
+        Runs the MSIS model for the given datetime and geodetic coordinates.
         """
+        index = (self.omni2_data["Timestamp"] - dt).abs().idxmin()
+        f107_daily = float(self.omni2_data.iloc[index - 1]["f10.7_index"])
+        ap_current = float(self.omni2_data.iloc[index - 1]["ap_index_nT"])
 
-        # Find the closest row in OMNI2 data
-        #print("HEHRE")
-        #embed();quit()
+        # Prepare Ap indices
+        aps = self.prepare_ap_indices(dt, ap_current, index)
 
-        # We want to replicate the initial state through the output so we only
-        # keep the initial date
-        if self.initial_date is None:
-            self.initial_date = dt
-            row = self.omni2_data.loc[0] #HACK: replace iwth last value in OMNI dataset
-        else:
-            row = self.omni2_data.iloc[(self.omni2_data['Timestamp'] - dt).abs().argmin()]
-
-        f107_daily = row['f10.7_index_pred']
-        ap_current = row['ap_index_nT_pred']
-
-        # Prepare Ap indices using the helper function
-        #print(row, self.initial_date, ap_current)
-
-        # TODO: generate AP for past data points
-        #aps = self._prepare_ap_indices(self.initial_date, ap_current) 
-        aps = ap_current
-
-        # Run the MSIS model
         try:
             result = msis.run(
                 dates=[[dt]],
@@ -265,275 +238,329 @@ class PersistenceMSIS():
                 lats=[[lat]],
                 alts=[[alt]],
                 f107s=[[f107_daily]],
-                aps=[[aps]],
-                geomagnetic_activity=1 #TODO: Change this when AP past points is used. Account for geomagnetic activity (1 = Daily Ap mode, -1 = Storm-time Ap mode)
+                aps=[aps],
             )
-        except:
-            embed();quit()
-        total_mass_density = result[0,0]  # Return the density for the specific point
-        #print(f"Total mass density: {total_mass_density} kg/m^3, ap: {aps}, f107: {f107_daily}, lon: {lon}, lat: {lat}, alt: {alt}, dt: {dt}")
-        return total_mass_density
+        except Exception as e:
+            logger.error(f"Error running MSIS: {e}")
+            raise
 
-    def _prepare_ap_indices(self, datetime_input, ap_current):
+        return result[0, 0]
+
+    def prepare_ap_indices(self, dt, ap_current, index):
         """
-        Private helper function to compute Ap indices and averages required for MSIS.
-
-        Parameters:
-            datetime_input (datetime): Datetime for the simulation.
-            ap_current (float): Current daily Ap value.
-
-        Returns:
-            list: Prepared Ap array for MSIS input.
+        Helper method to compute the Ap index array needed by MSIS.
         """
-        index = self.omni2_data.index[self.omni2_data['Timestamp'] == datetime_input][0]
-
-        # Compute 3-hourly Ap indices
-        ap_3hr_indices = [
-            self.omni2_data.iloc[index - i]['ap_index_nT'] if (index - i) >= 0 else ap_current
-            for i in range(0, 4)
+        ap_3hr = [
+            self.omni2_data.iloc[index - i]["ap_index_nT"]
+            if (index - i) >= 0
+            else ap_current
+            for i in range(4)
         ]
-
-        # Compute averages for specific periods
-        ap_12_33_avg = np.mean([
-            self.omni2_data.iloc[index - i]['ap_index_nT'] if (index - i) >= 0 else ap_current
-            for i in range(12, 34, 3)
-        ])
-        ap_36_57_avg = np.mean([
-            self.omni2_data.iloc[index - i]['ap_index_nT'] if (index - i) >= 0 else ap_current
-            for i in range(36, 58, 3)
-        ])
-
-        # Prepare Ap array
+        ap_12_33_avg = np.mean(
+            [
+                self.omni2_data.iloc[index - i]["ap_index_nT"]
+                if (index - i) >= 0
+                else ap_current
+                for i in range(12, 34, 3)
+            ]
+        )
+        ap_36_57_avg = np.mean(
+            [
+                self.omni2_data.iloc[index - i]["ap_index_nT"]
+                if (index - i) >= 0
+                else ap_current
+                for i in range(36, 58, 3)
+            ]
+        )
         aps = [
-            ap_current,  # Daily Ap
-            ap_3hr_indices[0],  # Current 3-hour Ap
-            ap_3hr_indices[1],  # 3 hours before
-            ap_3hr_indices[2],  # 6 hours before
-            ap_3hr_indices[3],  # 9 hours before
-            ap_12_33_avg,       # Average of 12-33 hours prior
-            ap_36_57_avg        # Average of 36-57 hours prior
+            float(ap_current),
+            float(ap_3hr[0]),
+            float(ap_3hr[1]),
+            float(ap_3hr[2]),
+            float(ap_3hr[3]),
+            float(ap_12_33_avg),
+            float(ap_36_57_avg),
         ]
-
         return aps
+
 
 class MSISPersistenceAtmosphere(PythonAtmosphere):
     """
-    CustomAtmosphere is a custom implementation of the PythonAtmosphere class
-    that uses the PersistenceModel to compute atmospheric density and velocity.
-
-    Attributes:
-        atm (PersistenceModel): An instance of the PersistenceModel.
-        earth (Body): The central body (Earth) for the atmospheric model.
-
-    Methods:
-        getMSISPersistence(input_df: pd.DataFrame) -> pd.DataFrame:
-            Generates persistent MSIS data using the PersistenceModel.
-
-        getDensity(date: AbsoluteDate, position: Vector3D, frame: Frame) -> float:
-            Computes the atmospheric density at a given date, position, and frame
-            using the PersistenceModel output.
-
-        _position_to_geo(position: Vector3D) -> Tuple[float, float, float]:
-            Helper method to convert position to latitude, longitude, and altitude.
+    Custom atmospheric model that uses PersistenceMSIS to compute density.
     """
-    def __init__(self, omni2, **kwargs):
-        super().__init__()
-        self.atm = PersistenceMSIS(omni2)
 
-        r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS #m
-        self.itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True) # International Terrestrial Reference Frame, earth fixed
-        self.earth = OneAxisEllipsoid(
-                         r_Earth,
-                         Constants.IERS2010_EARTH_FLATTENING,
-                         self.itrf
-                    )
+    def __init__(self, forecasted_omni2_data, historical_omni_data):
+        super().__init__()
+        self.atm = PersistenceMSIS(forecasted_omni2_data, historical_omni_data)
+
+        r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS  # m
+        self.itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
+        self.earth = OneAxisEllipsoid(r_Earth, Constants.IERS2010_EARTH_FLATTENING, self.itrf)
 
     def getDensity(self, date: AbsoluteDate, position: Vector3D, frame: Frame) -> float:
         """
-        Compute the atmospheric density at a given date, position, and frame using the PersistenceModel output.
-
-        Args:
-            date (AbsoluteDate): The date for which to compute density.
-            position (Vector3D): The position in the given frame.
-            frame (Frame): The reference frame.
-
-        Returns:
-            float: The computed atmospheric density.
+        Compute atmospheric density at the given date, position, and frame.
         """
         try:
             lat, lon, alt = self._position_to_geo(position, date)
-
-            # Convert date
-            time_str = date.toString(0)
-            dt = pd.to_datetime(time_str).tz_localize(None)
-
-            # Get persistence model output
+            dt = pd.to_datetime(date.toString(0)).tz_localize(None)
             density = self.atm.run(dt, lon, lat, alt)
-            #print(f"Date: {dt}, Density: {float(density)} kg/m^3")
             return float(density)
         except Exception as e:
-            print(f"Error in getDensity: {e}")
-            print(f"Date: {date}, Position: {position}, Frame: {frame}")
+            logger.error(f"Error in getDensity: {e}")
             raise
 
-
     def getVelocity(self, date: AbsoluteDate, position: Vector3D, frame: Frame):
-        '''
-        Get the inertial velocity of atmosphere molecules.
-        By default, atmosphere is supposed to have a null
-        velocity in the central body frame.</p>
-        '''
-        # get the transform from body frame to the inertial frame
+        """
+        Compute atmospheric velocity (assumed zero in Earth-fixed frame).
+        """
         bodyToFrame = self.earth.getBodyFrame().getKinematicTransformTo(frame, date)
-        # Inverse transform the position to the body frame
         posInBody = bodyToFrame.getStaticInverse().transformPosition(position)
-        # Create PVCoordinates object assuming zero velocity in body frame
         pv_body = PVCoordinates(posInBody, Vector3D.ZERO)
-        # Transform the position/velocity (PV) coordinates to the given frame
         pvFrame = bodyToFrame.transformOnlyPV(pv_body)
-        # Return the velocity in the current frame
         return pvFrame.getVelocity()
 
-    def _position_to_geo(self, positionICRF, date):
-            """
-            Converts a position vector (in ICRF frame) to geodetic coordinates (lat, lon, alt).
-    
-            Parameters:
-            positionICRF: Vector3D, position vector in ICRF frame.
-            date: AbsoluteDate, the date of the position.
-    
-            Returns:
-            tuple: (latitude, longitude, altitude) in degrees and meters.
-            """
-            # Create a PVCoordinates object (assuming zero velocity)
-            pvICRF = PVCoordinates(positionICRF, Vector3D.ZERO)
-    
-            # Transform position from ICRF to ECEF (ITRF)
-            transform = self.earth.getBodyFrame().getTransformTo(self.itrf, date)
-            pvECEF = transform.transformPVCoordinates(pvICRF)
-            positionECEF = pvECEF.getPosition()
-    
-            # Convert the ECEF position to geodetic coordinates
-            geodeticPoint = self.earth.transform(positionECEF, self.itrf, date)
-    
-            # Extract latitude, longitude, and altitude
-            latitude = geodeticPoint.getLatitude()  # radians
-            longitude = geodeticPoint.getLongitude()  # radians
-            altitude = geodeticPoint.getAltitude()  # meters
-    
-            # Convert radians to degrees for latitude and longitude
-            latitudeDeg = math.degrees(latitude)
-            longitudeDeg = math.degrees(longitude)
-    
-            return latitudeDeg, longitudeDeg, altitude
-
-class PersistenceModel(nn.Module):
-    def __init__(self, plot_trajectory=False):
-        super().__init__()
-        self.plot = plot_trajectory
-    
-    def forward(self, omni2_data, initial_state={}):        
-        states, densities = prop_orbit(
-                                initial_state, 
-                                MSISPersistenceAtmosphere,
-                                atm_model_data=omni2_data, 
-                                plot_trajectory=self.plot
-                            )
-
-        return self._convert_to_df(states, densities)
-
-
-    def _convert_to_df(self, states, densities):
+    def _position_to_geo(self, position, date):
         """
-        Generates a DataFrame with timestamps and atmospheric densities.
+        Convert a position vector in ICRF to geodetic coordinates.
+        Returns (latitude [deg], longitude [deg], altitude [m]).
+        """
+        pvICRF = PVCoordinates(position, Vector3D.ZERO)
+        transform = self.earth.getBodyFrame().getTransformTo(self.itrf, date)
+        pvECEF = transform.transformPVCoordinates(pvICRF)
+        positionECEF = pvECEF.getPosition()
+        geodeticPoint = self.earth.transform(positionECEF, self.itrf, date)
+        lat = math.degrees(geodeticPoint.getLatitude())
+        lon = math.degrees(geodeticPoint.getLongitude())
+        alt = geodeticPoint.getAltitude()
+        return lat, lon, alt
 
-        Parameters:
-        - states (list of SpacecraftState): List of spacecraft states from the propagator.
-        - densities (list of float): List of atmospheric densities corresponding to each state.
+
+# =============================================================================
+# DataHandler Class
+# =============================================================================
+class DataHandler:
+    """
+    Handles file I/O for initial state, OMNI, and density data.
+    """
+
+    def __init__(
+        self,
+        omni_folder,
+        initial_state_folder,
+        sat_density_folder,
+        forecasted_omni2_folder,
+        sat_density_omni_forecasted_folder,
+        sat_density_omni_propagated_folder,
+    ):
+        self.omni_folder = omni_folder
+        self.initial_state_folder = initial_state_folder
+        self.sat_density_folder = sat_density_folder
+        self.forecasted_omni2_folder = forecasted_omni2_folder
+        self.sat_density_omni_forecasted_folder = sat_density_omni_forecasted_folder
+        self.sat_density_omni_propagated_folder = sat_density_omni_propagated_folder
+        self._read_initial_states()
+
+    def _read_initial_states(self):
+        dataframes = []
+        for file in self.initial_state_folder.iterdir():
+            if file.suffix == ".csv":
+                df = pd.read_csv(file)
+                dataframes.append(df)
+        self.initial_states = pd.concat(dataframes, ignore_index=True)
+        logger.info(f"Loaded initial state data with {len(self.initial_states)} rows.")
+
+    def get_initial_state(self, file_id):
+        return self.initial_states[self.initial_states["File ID"] == file_id].iloc[0]
+
+    def read_omni_data(self, file_id):
+        file_id_str = f"{file_id:05d}"
+        for file in self.omni_folder.iterdir():
+            if file.suffix == ".csv" and file_id_str in file.stem:
+                logger.debug(f"Reading OMNI data for File ID {file_id_str}.")
+                return pd.read_csv(file)
+        raise FileNotFoundError(f"OMNI data for File ID {file_id} not found.")
+
+    def read_sat_density_forecast(self, file_id):
+        file_id_str = f"{file_id:05d}"
+        for file in self.sat_density_omni_forecasted_folder.iterdir():
+            if file.suffix == ".csv" and file_id_str in file.stem:
+                logger.debug(f"Reading forecasted density data for File ID {file_id_str}.")
+                return pd.read_csv(file)
+        raise FileNotFoundError(f"Forecasted sat density data for File ID {file_id} not found.")
+
+    def save_propagated_results(self, file_id: int, df: pd.DataFrame) -> None:
+        """
+        Saves the propagated results DataFrame for the given file ID.
+        
+        This function locates the corresponding forecast file (by matching file ID)
+        in the 'sat_density_omni_forecasted_folder' and uses its name to save the DataFrame
+        into the 'sat_density_omni_propagated_folder'.
+        
+        Args:
+            file_id (int): The file identifier.
+            df (pd.DataFrame): DataFrame containing the propagated results.
+        
+        Raises:
+            FileNotFoundError: If no forecast file corresponding to the file_id is found.
+        """
+        file_id_str = f"{file_id:05d}"
+        output_file = None
+        for file in self.sat_density_omni_forecasted_folder.iterdir():
+            if file.suffix == ".csv" and file_id_str in file.stem:
+                output_file = file.name
+                break
+        if output_file is None:
+            raise FileNotFoundError(f"Could not locate forecast file for File ID {file_id}")
+
+        output_path = self.sat_density_omni_propagated_folder / output_file
+        df.to_csv(output_path, index=False)
+        logger.info(f"Simulation complete. Results saved to {output_path}")
+
+    def get_all_file_ids_from_folder(self):
+        """
+        Retrieves all file IDs from the sat_density_omni_forecasted_folder.
 
         Returns:
-        - pd.DataFrame: A DataFrame with columns ['timestamp', 'density'].
+            list: List of file IDs.
         """
-        # Initialize a list to hold data
-        density_data = []
-
-        # Iterate through states and densities
-        for state, density in zip(states, densities):
-            # Extract timestamp from the state
-            timestamp = pd.to_datetime(state.getDate().toString(0))  # Convert to pandas datetime
-
-            # Append data to the list
-            density_data.append({'Timestamp': timestamp, 'Density (kg/m3)': density})
-
-        # Convert the list to a DataFrame
-        df = pd.DataFrame(density_data)
-
-        return df
+        file_ids = []
+        for file in self.sat_density_omni_forecasted_folder.iterdir():
+            if file.suffix == ".csv" and file.stem.startswith("sat_density_"):
+                file_id_str = file.stem.split("_")[-1]
+                try:
+                    file_id = int(file_id_str)
+                    file_ids.append(file_id)
+                except ValueError:
+                    logger.warning(f"Invalid file ID in filename: {file.name}")
+        return file_ids
 
 
+# =============================================================================
+# SimulationRunner Class
+# =============================================================================
+class SimulationRunner:
+    """
+    Runs the complete simulation pipeline for a given file ID.
+    """
 
-#==============================================================================
-# Load OMNI2 data directly
-file_path = './data/sat_density_omni_forcasted/sat_density_00000.csv'
-#omni2_data = pd.read_csv(file_path, usecols=['Timestamp', 'f10.7_index', 'ap_index_nT'])
-omni2_data = pd.read_csv(file_path, usecols=['Timestamp','Orbit Mean Density (kg/m^3)','ap_index_nT_pred','f10.7_index_pred'])
+    def __init__(self, file_id, data_handler, propagation_minutes=10, propagation_secs=60):
+        """
+        Initialize the runner.
 
-# Process OMNI2 data immediately after loading
-omni2_data['Timestamp'] = pd.to_datetime(omni2_data['Timestamp'])
-omni2_data = omni2_data.ffill()
-print(omni2_data)
+        Args:
+            file_id (int): The file identifier.
+            data_handler (DataHandler): Data handler instance.
+            propagation_minutes (int): Number of minutes to propagate.
+            propagation_secs (int): Seconds per propagation step.
+        """
+        self.file_id = file_id
+        self.data_handler = data_handler
+        self.propagation_step = propagation_minutes * propagation_secs
 
-atm = MSISPersistenceAtmosphere(omni2_data)
-date = AbsoluteDate(2013, 11, 29, 0, 0, 0.000, TimeScalesFactory.getUTC()
-)
+    def run_simulation(self):
+        """
+        Runs the simulation:
+            1. Loads required data.
+            2. Sets up the MSIS persistence atmosphere.
+            3. Builds the initial orbit.
+            4. Propagates the orbit.
+            5. Matches computed densities with forecasted timestamps.
+            6. Saves the output.
+        """
+        logger.info(f"Starting simulation for File ID {self.file_id:05d}.")
 
-mu = Constants.IERS2010_EARTH_MU #m^3/s^2
-degree = 70
-torder = 70
-cr = 1.0
-utc = TimeScalesFactory.getUTC()
-sun = CelestialBodyFactory.getSun()
+        # Load data from files
+        forecasted_omni = self.data_handler.read_sat_density_forecast(self.file_id)
+        historical_omni = self.data_handler.read_omni_data(self.file_id)
+        initial_state = self.data_handler.get_initial_state(self.file_id)
 
-# Initialize the Vector3D for position
-position = Vector3D(5_870_038.485921082, 2_396_433.1768343644, 2_396_433.176834364)
+        # Ensure forecasted data has proper datetime formatting and fill missing values
+        forecasted_omni["Timestamp"] = pd.to_datetime(forecasted_omni["Timestamp"])
+        forecasted_omni = forecasted_omni.ffill()
 
-# Initialize the Frame (EME2000)
-frame = FramesFactory.getEME2000() 
+        # Build the custom atmosphere model
+        atmosphere = MSISPersistenceAtmosphere(forecasted_omni, historical_omni)
 
-r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS #m
-itrf    = FramesFactory.getITRF(IERSConventions.IERS_2010, True) # International Terrestrial Reference Frame, earth fixed
-inertialFrame = FramesFactory.getEME2000()
-earth = OneAxisEllipsoid(r_Earth,
-                         Constants.IERS2010_EARTH_FLATTENING,
-                         itrf)
-mu = Constants.IERS2010_EARTH_MU #m^3/s^2
-utc = TimeScalesFactory.getUTC()
+        # Build the initial orbit using the initial state values
+        a0 = float(initial_state["Semi-major Axis (km)"]) * 1e3  # meters
+        e0 = float(initial_state["Eccentricity"])
+        w0 = radians(initial_state["Argument of Perigee (deg)"])
+        i0 = radians(initial_state["Inclination (deg)"])
+        ra0 = radians(initial_state["RAAN (deg)"])
+        M0 = radians(initial_state["True Anomaly (deg)"])
 
-#File ID,Timestamp,Semi-major Axis (km),Eccentricity,Inclination (deg),RAAN (deg),Argument of Perigee (deg),True Anomaly (deg),Latitude (deg),Longitude (deg),Altitude (km)
-#0,2000-08-02 04:50:33,6826.387246918713,0.0038817999884486,87.27530555555555,144.13511111111112,257.3143888888889,102.383269692981,43.63781476773328,-62.54312803592875,466.44889019083695
+        initial_date = pd.to_datetime(initial_state["Timestamp"])
+        abs_date = AbsoluteDate(
+            initial_date.year,
+            initial_date.month,
+            initial_date.day,
+            initial_date.hour,
+            initial_date.minute,
+            initial_date.second + initial_date.microsecond * 1e-6,
+            TimeScalesFactory.getUTC(),
+        )
+        inertial_frame = FramesFactory.getEME2000()
+        mu = Constants.IERS2010_EARTH_MU
 
-rp0 = r_Earth + 400 * 1e3 # perigee radius (m)
-ra0 = r_Earth + 600 * 1e3 # apogee radius (m)
-deg = np.pi / 180
-a0 = 6826.387246918713 * 1e3 # semi-major axis (m)
-e0 = 0.0038817999884486 # eccentricity 
-w0 = radians(257.3143888888889) # perigee argument (rad)
-i0 = radians(87.27530555555555) # inclination (rad)
-ra0 = radians(144.13511111111112) # right ascension of ascending node (rad)
-M0 = radians(102.383269692981) # anomaly
+        initial_orbit = KeplerianOrbit(
+            a0,
+            e0,
+            i0,
+            w0,
+            ra0,
+            M0,
+            PositionAngleType.TRUE,
+            inertial_frame,
+            abs_date,
+            mu,
+        )
 
-initialDate = AbsoluteDate(2000, 8, 2, 4, 50, 33.000, TimeScalesFactory.getUTC()) # date of orbit parameters
+        # Propagate the orbit
+        propagator = OrbitPropagator(initial_orbit, self.propagation_step, atmosphere)
+        timestamps, states, densities = propagator.propagate(forecasted_omni)
 
-initialOrbit = KeplerianOrbit(a0, e0, i0, w0, ra0, M0, PositionAngleType.TRUE, inertialFrame, initialDate, mu)
+        # Convert Orekit AbsoluteDate timestamps to pandas datetime
+        timestamps_pd = [pd.to_datetime(ts.toString(0)).tz_localize(None) for ts in timestamps]
 
-duration = 1 * 86400.0 # 1 day in seconds
+        # Update forecasted DataFrame with computed densities
+        new_df = forecasted_omni.copy()
+        new_df["MSIS Density (kg/m^3)"] = np.nan
+        for ts, density in zip(timestamps_pd, densities):
+            new_df.loc[new_df["Timestamp"] == ts, "MSIS Density (kg/m^3)"] = density
 
-secs = 60.0
-mins = 10
-step = secs * mins # propagation step size [s]
+        self.data_handler.save_propagated_results(self.file_id, new_df)
 
-states, densities = prop_orbit(initialOrbit, duration, step, atm)
-#atm.getDensity(date, position, frame)
 
-# model = PersistenceModel(plot_trajectory=True)
-# predictions = model(omni2_data)
+# =============================================================================
+# Main Execution: Process Multiple File IDs
+# =============================================================================
+if __name__ == "__main__":
+    # Define folder paths (adjust as needed)
+    omni_folder = Path("./data/omni2")
+    initial_state_folder = Path("./data/initial_state")
+    sat_density_folder = Path("./data/sat_density")
+    forecasted_omni2_folder = Path("./data/forcasted_omni2")
+    sat_density_omni_forecasted_folder = Path("./data/sat_density_omni_forcasted")
+    sat_density_omni_propagated_folder = Path("./data/sat_density_omni_propagated")
+
+    # Create DataHandler instance
+    data_handler = DataHandler(
+        omni_folder,
+        initial_state_folder,
+        sat_density_folder,
+        forecasted_omni2_folder,
+        sat_density_omni_forecasted_folder,
+        sat_density_omni_propagated_folder,
+    )
+
+    # Get all file IDs from the sat_density_omni_forecasted_folder
+    file_ids = data_handler.get_all_file_ids_from_folder()
+
+    # Process each file ID
+    for file_id in file_ids:
+        try:
+            runner = SimulationRunner(file_id, data_handler)
+            runner.run_simulation()
+        except Exception as e:
+            logger.error(f"Error processing File ID {file_id:05d}: {e}")
