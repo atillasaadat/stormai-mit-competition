@@ -41,6 +41,7 @@ Usage Example:
 import pandas as pd
 from pathlib import Path
 import logging
+import re
 
 # =============================================================================
 # DataHandler Class
@@ -90,7 +91,7 @@ class DataHandler:
                 df = pd.read_csv(file)
                 dataframes.append(df)
         self.initial_states = pd.concat(dataframes, ignore_index=True)
-        self.logger.info(f"Loaded initial state data with {len(self.initial_states)} rows.")
+        self.logger.debug(f"Loaded initial state data with {len(self.initial_states)} rows.")
 
     def get_initial_state(self, file_id):
         """
@@ -124,7 +125,7 @@ class DataHandler:
                 self.logger.debug(f"Reading {folder.stem} data for File ID {file_id_str}.")
                 data = pd.read_csv(file)
                 data = data.sort_values(by="Timestamp").reset_index(drop=True)
-                data["Timestamp"] = pd.to_datetime(data["Timestamp"])
+                data["Timestamp"] = pd.to_datetime(data["Timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
                 return data
         raise FileNotFoundError(f"{folder.stem} data for File ID {file_id} not found.")
 
@@ -156,22 +157,27 @@ class DataHandler:
 
     def get_all_file_ids_from_folder(self, folder: Path) -> list:
         """
-        Retrieves all file IDs from the folder.
+        Retrieves all file IDs from .csv filenames in the given folder.
+        The file ID is identified as a 5-digit number surrounded by hyphens (e.g., "-12345-").
 
         Args:
             folder (Path): The folder to retrieve file IDs from.
 
         Returns:
-            list: List of file IDs.
+            list: List of file IDs as integers.
         """
         file_ids = []
+        pattern = re.compile(r"-(\d{5})-")
+        
         for file in folder.iterdir():
-            if file.suffix == ".csv" and file.stem.startswith("sat_density_"):
-                file_id_str = file.stem.split("_")[-1]
-                try:
-                    file_ids.append(int(file_id_str))
-                except ValueError:
-                    self.logger.warning(f"Invalid file ID in filename: {file.name}")
+            if file.suffix == ".csv":
+                match = pattern.search(file.stem)
+                if match:
+                    try:
+                        file_ids.append(int(match.group(1)))
+                    except ValueError:
+                        self.logger.warning(f"Invalid file ID in filename: {file.name}")
+        
         return file_ids
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from org.orekit.forces.gravity import HolmesFeatherstoneAttractionModel, ThirdBo
 from org.orekit.forces.gravity import SolidTides
 from org.orekit.forces.radiation import SolarRadiationPressure, IsotropicRadiationSingleCoefficient
 from org.orekit.forces.drag import IsotropicDrag, DragForce
+from org.orekit.orbits import OrbitType
 from orekit import JArray_double
 from java.util import ArrayList
 from org.hipparchus.geometry.euclidean.threed import Vector3D
@@ -79,7 +80,7 @@ class OrbitPropagator:
         Returns:
             tuple: (timestamps, states, densities)
         """
-        logger.info("Initializing orbit propagation.")
+        logger.debug("Initializing orbit propagation.")
 
         # Time span: use forecasted timestamps from the forecasted OMNI2 DataFrame
         # (timestamps must be in pandas datetime format)
@@ -109,7 +110,8 @@ class OrbitPropagator:
         )
         integrator.setInitialStepSize(self.sim_config["init_step"])
         propagator = NumericalPropagator(integrator)
-        propagator.setOrbitType(orbit_type)
+        #propagator.setOrbitType(orbit_type)
+        propagator.setOrbitType(OrbitType.CIRCULAR) #HACK: Use if this occurs: org.orekit.errors.OrekitException: invalid parameter eccentricity: -0 not in range [0, ∞]
         propagator.setInitialState(initial_state)
 
         # --- Add force models ---
@@ -151,19 +153,19 @@ class OrbitPropagator:
 
         # Propagate over the entire timespan
         states = []
-        logger.info(f"Beginning orbit propagation over {len(tspan)} time steps.")
+        logger.debug(f"Beginning orbit propagation over {len(tspan)} time steps.")
         tic = time.time()
         progress_interval = max(1, len(tspan) // 20)  # Calculate interval for 5% progress
         for idx, current_date in enumerate(tspan):
             if idx % progress_interval == 0:
                 progress = (idx / len(tspan)) * 100
-                logger.info(f"Propagation progress: {progress:.1f}%")
+                logger.debug(f"Propagation progress: {progress:.1f}%")
             logger.debug(f"Propagating to {current_date} ({idx + 1}/{len(tspan)})")
             state = propagator.propagate(current_date)
             states.append(state)
         toc = time.time()
-        logger.info(f"Propagation completed in {toc - tic:.3f} seconds.")
-        logger.info("Propagation progress: 100.0%")
+        logger.debug(f"Propagation completed in {toc - tic:.3f} seconds.")
+        logger.debug("Propagation progress: 100.0%")
 
         # Compute atmospheric densities for each propagated state
         densities = []
@@ -349,7 +351,7 @@ class SimulationRunner:
 
         # Build the initial orbit using the initial state values
         a0 = float(initial_state["Semi-major Axis (km)"]) * 1e3  # meters
-        e0 = float(initial_state["Eccentricity"])
+        e0 = max(0.0, float(initial_state["Eccentricity"]))
         w0 = radians(initial_state["Argument of Perigee (deg)"])
         i0 = radians(initial_state["Inclination (deg)"])
         ra0 = radians(initial_state["RAAN (deg)"])
@@ -398,39 +400,176 @@ class SimulationRunner:
         return new_df
 
 
-if __name__ == "__main__":
-    # Satellite and force model parameters
-    sat_config = {
-        "satellite_mass_kg": 522.0,  # kg
-        "cross_section_m2": 0.9,  # m^2
-        "srp_area_m2": 0.9,  # m^2
-        "drag_coeff": 2.2,
-        "cr": 1.0,
-    }
-    # Integrator tolerances and step sizes
-    sim_config = {
-        "min_step": 1e-6,
-        "max_step": 100.0,
-        "init_step": 1.0,
-        "pos_tol": 1e-4,
-        "spherical_harmonics": (70, 70),
-    }
+# if __name__ == "__main__":
+#     # Satellite and force model parameters
+#     sat_config = {
+#         "satellite_mass_kg": 100.0,  # kg
+#         "cross_section_m2": 1.0,  # m^2
+#         "srp_area_m2": 1.0,  # m^2
+#         "drag_coeff": 2.2,
+#         "cr": 1.0,
+#     }
+#     # Integrator tolerances and step sizes
+#     sim_config = {
+#         "min_step": 1e-6,
+#         "max_step": 60.0,
+#         "init_step": 1.0,
+#         "pos_tol": 1e-4,
+#         "spherical_harmonics": (64, 64),
+#     }
 
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    logger = logging.getLogger(__name__)
+#     # Set up logging
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format="%(asctime)s - %(levelname)s - %(message)s",
+#     )
+#     logger = logging.getLogger(__name__)
     
-    dh = DataHandler(logger,
-        omni2_folder = Path("./data/omni2"),
-        initial_state_folder = Path("./data/initial_state"),
-        sat_density_folder = Path("./data/sat_density"),
-        forcasted_omni2_folder = Path("./data/forcasted_omni2"),
-        sat_density_omni_forcasted_folder = Path("./data/sat_density_omni_forcasted"),
-        sat_density_omni_propagated_folder = Path("./data/sat_density_omni_propagated"),
-    )
-    sim = SimulationRunner(logger, sat_config, sim_config)
-    density_results = sim.run_simulation(1, dh.get_initial_state(1), dh.read_csv_data(1, dh.omni2_folder), dh.read_csv_data(1, dh.sat_density_folder))
-    from IPython import embed; embed(); quit()
+#     dh = DataHandler(logger,
+#         omni2_folder = Path("./data/omni2"),
+#         initial_state_folder = Path("./data/initial_state"),
+#         sat_density_folder = Path("./data/sat_density"),
+#         forcasted_omni2_folder = Path("./data/forcasted_omni2"),
+#         sat_density_omni_forcasted_folder = Path("./data/sat_density_omni_forcasted"),
+#         sat_density_omni_propagated_folder = Path("./data/sat_density_omni_propagated"),
+#     )
+#     sim = SimulationRunner(logger, sat_config, sim_config)
+#     all_file_ids = dh.get_all_file_ids_from_folder(dh.sat_density_folder)
+#     total_files = len(all_file_ids)
+#     for idx, file_id in enumerate(all_file_ids):
+#         file_id = 1016
+#         initial_state = dh.get_initial_state(file_id)
+#         omni_data = dh.read_csv_data(file_id, dh.omni2_folder)
+#         sat_density_truth = dh.read_csv_data(file_id, dh.sat_density_folder)
+#         density_results = sim.run_simulation(file_id, initial_state=initial_state, space_weather_data=omni_data, sat_density_truth=sat_density_truth)
+#         dh.save_df_from_copy_folder_path(file_id, density_results, dh.sat_density_folder, dh.sat_density_omni_propagated_folder)
+#         logging.info(f"Completion: {(idx/total_files)*100:.1f}/% ({idx}/{total_files})")
+#         break
+#     logging.info("Simulation complete.")
+
+
+# =============================================================================
+
+import os
+import logging
+import multiprocessing
+from pathlib import Path
+
+# Import necessary classes
+from datahandler import DataHandler
+from orekit_propagator import SimulationRunner
+
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module="pymsis.utils")
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Satellite and force model parameters
+sat_config = {
+    "satellite_mass_kg": 100.0,  # kg
+    "cross_section_m2": 1.0,  # m^2
+    "srp_area_m2": 1.0,  # m^2
+    "drag_coeff": 2.2,
+    "cr": 1.0,
+}
+
+# Integrator tolerances and step sizes
+sim_config = {
+    "min_step": 1e-6,
+    "max_step": 100.0,
+    "init_step": 60.0,
+    "pos_tol": 1e-4,
+    "spherical_harmonics": (64, 64),
+}
+
+# Paths for data handling
+data_paths = {
+    "omni2_folder": Path("./data/omni2"),
+    "initial_state_folder": Path("./data/initial_state"),
+    "sat_density_folder": Path("./data/sat_density"),
+    "forcasted_omni2_folder": Path("./data/forcasted_omni2"),
+    "sat_density_omni_forcasted_folder": Path("./data/sat_density_omni_forcasted"),
+    "sat_density_omni_propagated_folder": Path("./data/sat_density_omni_propagated"),
+}
+
+# Get file IDs
+dh = DataHandler(logger, **data_paths)
+all_file_ids = sorted(dh.get_all_file_ids_from_folder(dh.sat_density_folder))
+total_files = len(all_file_ids)
+logger.info(f"Total files to process: {total_files}, [{all_file_ids[0]} - {all_file_ids[-1]}]")
+
+def pool_init(shared_counter, lock):
+    """ Initialize Orekit JVM in each worker process and share progress counter. """
+    import orekit
+    from orekit.pyhelpers import setup_orekit_curdir
+
+    # Start Orekit VM in each process
+    orekit.initVM()
+    setup_orekit_curdir(from_pip_library=True)
+
+    # Make shared counter accessible
+    global completed_files, counter_lock
+    completed_files = shared_counter
+    counter_lock = lock
+
+
+def process_file(file_id):
+    """ Function to process a single file in parallel with progress tracking. """
+    try:
+        # Initialize logger in the worker
+        logger = logging.getLogger(__name__)
+
+        # Initialize local instances in each process
+        dh_worker = DataHandler(logger, **data_paths)
+        sim_worker = SimulationRunner(logger, sat_config, sim_config)
+
+        # Load data
+        initial_state = dh_worker.get_initial_state(file_id)
+        omni_data = dh_worker.read_csv_data(file_id, dh_worker.omni2_folder)
+        sat_density_truth = dh_worker.read_csv_data(file_id, dh_worker.sat_density_folder)
+
+        # Run simulation
+        density_results = sim_worker.run_simulation(
+            file_id,
+            initial_state=initial_state,
+            space_weather_data=omni_data,
+            sat_density_truth=sat_density_truth,
+        )
+
+        # Save results
+        dh_worker.save_df_from_copy_folder_path(file_id, density_results, dh_worker.sat_density_folder, dh_worker.sat_density_omni_propagated_folder)
+
+        # Update completion count safely
+        with counter_lock:
+            completed_files.value += 1
+            progress = (completed_files.value / total_files) * 100
+            logger.info(f"Progress: {progress:.1f}% ({completed_files.value}/{total_files})")
+
+        return f"[{file_id}] OK"
+    except Exception as e:
+        logger.error(f"Error processing file {file_id}: {e}")
+        return f"[{file_id}] ERROR"
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()  # Required for Windows
+
+    workers = min(4, os.cpu_count()-1)  # Adjust worker count based on CPU cores
+    logger.info(f"Using {workers} worker processes for parallel processing.")
+
+    # Create shared counter and lock for progress tracking
+    with multiprocessing.Manager() as manager:
+        shared_counter = manager.Value("i", 0)  # Shared integer for tracking progress
+        lock = manager.Lock()  # Lock to ensure atomic updates
+
+        with multiprocessing.Pool(workers, initializer=pool_init, initargs=(shared_counter, lock)) as pool:
+            results = pool.map(process_file, all_file_ids)
+
+        for result in results:
+            logger.info(result)
+
+    logger.info("Simulation complete.")
