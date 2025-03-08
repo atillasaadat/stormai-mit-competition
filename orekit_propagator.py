@@ -386,6 +386,7 @@ class SimulationRunner:
         # Propagate the orbit
         propagator = OrbitPropagator(initial_orbit, atmosphere, self.sat_config, self.sim_config)
         timestamps, states, densities = propagator.propagate(sat_density_truth)
+        from IPython import embed; embed(); quit()
 
         # Convert Orekit AbsoluteDate timestamps to pandas datetime
         timestamps_pd = [pd.to_datetime(ts.toString(0)).tz_localize(None) for ts in timestamps]
@@ -393,8 +394,40 @@ class SimulationRunner:
         # Update forecasted DataFrame with computed densities
         new_df = sat_density_truth.copy()
         new_df["MSIS Density (kg/m^3)"] = np.nan
-        for ts, density in zip(timestamps_pd, densities):
+        new_df["Position X (km)"] = np.nan
+        new_df["Position Y (km)"] = np.nan
+        new_df["Position Z (km)"] = np.nan
+        new_df["Velocity X (km/s)"] = np.nan
+        new_df["Velocity Y (km/s)"] = np.nan
+        new_df["Velocity Z (km/s)"] = np.nan
+        new_df["Latitude (deg)"] = np.nan
+        new_df["Longitude (deg)"] = np.nan
+        new_df["Altitude (km)"] = np.nan
+        for ts, state, density in zip(timestamps_pd, states, densities):
+            # Get the position and velocity from the state
+            pv = state.getPVCoordinates()
+            pos = pv.getPosition()
+            vel = pv.getVelocity()
+            
+            lla = atmosphere.earth.transform(pos, atmosphere.itrf, state.getDate())
+
+            # Store density
             new_df.loc[new_df["Timestamp"] == ts, "MSIS Density (kg/m^3)"] = density
+            
+            # Convert position (m -> km) and store each component
+            new_df.loc[new_df["Timestamp"] == ts, "Position X (km)"] = pos.getX() * 1e-3
+            new_df.loc[new_df["Timestamp"] == ts, "Position Y (km)"] = pos.getY() * 1e-3
+            new_df.loc[new_df["Timestamp"] == ts, "Position Z (km)"] = pos.getZ() * 1e-3
+
+            # Convert velocity (m/s -> km/s) and store each component
+            new_df.loc[new_df["Timestamp"] == ts, "Velocity X (km/s)"] = vel.getX() * 1e-3
+            new_df.loc[new_df["Timestamp"] == ts, "Velocity Y (km/s)"] = vel.getY() * 1e-3
+            new_df.loc[new_df["Timestamp"] == ts, "Velocity Z (km/s)"] = vel.getZ() * 1e-3
+
+            # store each component of LLA
+            new_df.loc[new_df["Timestamp"] == ts, "Latitude (deg)"] =  math.degrees(lla.getLatitude())
+            new_df.loc[new_df["Timestamp"] == ts, "Longitude (deg)"] = math.degrees(lla.getLongitude())
+            new_df.loc[new_df["Timestamp"] == ts, "Altitude (km)"] =  lla.getAltitude() * 1e-3
 
         #self.data_handler.save_propagated_results(self.file_id, new_df)
         return new_df
@@ -412,9 +445,9 @@ class SimulationRunner:
 #     # Integrator tolerances and step sizes
 #     sim_config = {
 #         "min_step": 1e-6,
-#         "max_step": 60.0,
-#         "init_step": 1.0,
-#         "pos_tol": 1e-4,
+#         "max_step": 100.0,
+#         "init_step": 60.0,
+#         "pos_tol": 1e-3,
 #         "spherical_harmonics": (64, 64),
 #     }
 
@@ -437,7 +470,7 @@ class SimulationRunner:
 #     all_file_ids = dh.get_all_file_ids_from_folder(dh.sat_density_folder)
 #     total_files = len(all_file_ids)
 #     for idx, file_id in enumerate(all_file_ids):
-#         file_id = 1016
+#         file_id = 1
 #         initial_state = dh.get_initial_state(file_id)
 #         omni_data = dh.read_csv_data(file_id, dh.omni2_folder)
 #         sat_density_truth = dh.read_csv_data(file_id, dh.sat_density_folder)
@@ -468,6 +501,9 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pymsis.utils")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Flag to control overwriting output files.
+OVERWRITE = True  # Set to False to skip processing if output file exists
+
 # Satellite and force model parameters
 sat_config = {
     "satellite_mass_kg": 100.0,  # kg
@@ -482,7 +518,7 @@ sim_config = {
     "min_step": 1e-6,
     "max_step": 100.0,
     "init_step": 60.0,
-    "pos_tol": 1e-4,
+    "pos_tol": 1e-3,
     "spherical_harmonics": (64, 64),
 }
 
@@ -503,7 +539,7 @@ total_files = len(all_file_ids)
 logger.info(f"Total files to process: {total_files}, [{all_file_ids[0]} - {all_file_ids[-1]}]")
 
 def pool_init(shared_counter, lock):
-    """ Initialize Orekit JVM in each worker process and share progress counter. """
+    """Initialize Orekit JVM in each worker process and share progress counter."""
     import orekit
     from orekit.pyhelpers import setup_orekit_curdir
 
@@ -516,18 +552,26 @@ def pool_init(shared_counter, lock):
     completed_files = shared_counter
     counter_lock = lock
 
-
 def process_file(file_id):
-    """ Function to process a single file in parallel with progress tracking. """
+    """Process a single file in parallel with progress tracking and optional skipping."""
     try:
-        # Initialize logger in the worker
         logger = logging.getLogger(__name__)
 
-        # Initialize local instances in each process
+        # Create local instances in each worker process
         dh_worker = DataHandler(logger, **data_paths)
         sim_worker = SimulationRunner(logger, sat_config, sim_config)
 
-        # Load data
+        # Construct the output file path (assuming a CSV file is created with the file_id as name)
+        output_file = dh_worker.sat_density_omni_propagated_folder / f"{file_id}.csv"
+        if not OVERWRITE and output_file.exists():
+            logger.info(f"Skipping {file_id} as output file already exists.")
+            with counter_lock:
+                completed_files.value += 1
+                progress = (completed_files.value / total_files) * 100
+                logger.info(f"Progress: {progress:.1f}% ({completed_files.value}/{total_files})")
+            return f"[{file_id}] SKIPPED"
+
+        # Load input data
         initial_state = dh_worker.get_initial_state(file_id)
         omni_data = dh_worker.read_csv_data(file_id, dh_worker.omni2_folder)
         sat_density_truth = dh_worker.read_csv_data(file_id, dh_worker.sat_density_folder)
@@ -540,10 +584,15 @@ def process_file(file_id):
             sat_density_truth=sat_density_truth,
         )
 
-        # Save results
-        dh_worker.save_df_from_copy_folder_path(file_id, density_results, dh_worker.sat_density_folder, dh_worker.sat_density_omni_propagated_folder)
+        # Save the simulation results
+        dh_worker.save_df_from_copy_folder_path(
+            file_id,
+            density_results,
+            dh_worker.sat_density_folder,
+            dh_worker.sat_density_omni_propagated_folder,
+        )
 
-        # Update completion count safely
+        # Update progress count
         with counter_lock:
             completed_files.value += 1
             progress = (completed_files.value / total_files) * 100
@@ -554,17 +603,16 @@ def process_file(file_id):
         logger.error(f"Error processing file {file_id}: {e}")
         return f"[{file_id}] ERROR"
 
-
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # Required for Windows
 
-    workers = min(4, os.cpu_count()-1)  # Adjust worker count based on CPU cores
+    workers = min(4, os.cpu_count() - 1)  # Adjust worker count based on CPU cores
     logger.info(f"Using {workers} worker processes for parallel processing.")
 
     # Create shared counter and lock for progress tracking
     with multiprocessing.Manager() as manager:
-        shared_counter = manager.Value("i", 0)  # Shared integer for tracking progress
-        lock = manager.Lock()  # Lock to ensure atomic updates
+        shared_counter = manager.Value("i", 0)  # Shared counter for progress tracking
+        lock = manager.Lock()  # Lock for atomic counter updates
 
         with multiprocessing.Pool(workers, initializer=pool_init, initargs=(shared_counter, lock)) as pool:
             results = pool.map(process_file, all_file_ids)
