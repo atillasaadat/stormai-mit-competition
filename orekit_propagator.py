@@ -386,7 +386,6 @@ class SimulationRunner:
         # Propagate the orbit
         propagator = OrbitPropagator(initial_orbit, atmosphere, self.sat_config, self.sim_config)
         timestamps, states, densities = propagator.propagate(sat_density_truth)
-        from IPython import embed; embed(); quit()
 
         # Convert Orekit AbsoluteDate timestamps to pandas datetime
         timestamps_pd = [pd.to_datetime(ts.toString(0)).tz_localize(None) for ts in timestamps]
