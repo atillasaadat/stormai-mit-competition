@@ -33,15 +33,17 @@ logger = logging.getLogger(__name__)
 dh = DataHandler(logger, **data_paths)
 
 # User options:
-file_usage_percent = 0.05  # Use only 5% of the available files
+file_usage_percent = 0.8  # Use only 5% of the available files
 target_col = "Orbit Mean Density (kg/m^3)"  # Column to predict
 
-# Include more features: MSIS, Latitude, Longitude, Altitude.
+# For training, we want to use a log-transformed altitude.
+# So, after loading the data, we add a new column "log_Altitude"
+# and use it as a feature instead of raw "Altitude (km)".
 selected_feature_columns = [
     "MSIS Density (kg/m^3)",
-    "Latitude (deg)",
-    "Longitude (deg)",
-    "Altitude (km)"
+    #"Latitude (deg)",
+    #"Longitude (deg)",
+    "log_Altitude"  # new column to be computed from "Altitude (km)"
 ]
 
 # ---------------------------
@@ -50,9 +52,10 @@ selected_feature_columns = [
 propagated_file_ids = sorted(dh.get_all_file_ids_from_folder(dh.sat_density_omni_propagated_folder))
 logger.info(f"Total propagated files available: {len(propagated_file_ids)}")
 
+import random
 num_files_to_use = max(1, int(len(propagated_file_ids) * file_usage_percent))
-selected_file_ids = propagated_file_ids[:num_files_to_use]
-logger.info(f"Using {num_files_to_use} files for training (i.e. {file_usage_percent*100:.1f}%).")
+selected_file_ids = random.sample(propagated_file_ids, num_files_to_use)
+logger.info(f"Using {num_files_to_use} randomly selected files for training (i.e. {file_usage_percent*100:.1f}%).")
 
 dfs = []
 for file_id in selected_file_ids:
@@ -66,31 +69,37 @@ data.sort_values("Timestamp", inplace=True)
 data.reset_index(drop=True, inplace=True)
 logger.info(f"Combined dataset shape: {data.shape}")
 
-# Save raw data for plotting and inspection.
+# Save raw data for plotting (raw altitude will be used here).
 data_raw = data.copy()
 
-# Drop rows with NaNs in selected features or target.
-data = data.dropna(subset=selected_feature_columns + [target_col])
+# Drop rows with NaNs in our selected columns.
+data = data.dropna(subset=["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "Altitude (km)", target_col])
 logger.info(f"Dataset shape after dropping NaNs: {data.shape}")
 
+# Compute log10(Altitude) and store in a new column for training.
+data["log_Altitude"] = np.log10(data["Altitude (km)"])
+
 # ---------------------------
-# 2b. Optional: Print stats to check variability.
+# 2b. Optional: Print Statistics & Correlation
 # ---------------------------
 logger.info("Orbit Mean Density stats: " + str(data[target_col].describe()))
-corr_df = data[[target_col] + selected_feature_columns].corr()
+corr_df = data[[target_col] + ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]].corr()
 logger.info(f"Correlation matrix:\n{corr_df}")
 
 # ---------------------------
-# 3. Manual Scaling
+# 3. Manual Scaling (with target scaling adjustment)
 # ---------------------------
 epsilon = 1e-8
-X = data[selected_feature_columns].values
-y = data[target_col].values.reshape(-1, 1)
 
+# Scale input features.
+X = data[selected_feature_columns].values
 X_mean = np.mean(X, axis=0)
 X_std = np.std(X, axis=0)
 X_scaled = (X - X_mean) / (X_std + epsilon)
 
+# Scale target: first multiply by a factor to bring e-12 values to order 1.
+target_factor = 1e12
+y = data[target_col].values.reshape(-1, 1) * target_factor
 y_mean = np.mean(y, axis=0)
 y_std = np.std(y, axis=0)
 y_scaled = (y - y_mean) / (y_std + epsilon)
@@ -115,7 +124,7 @@ class TimeSeriesDataset(Dataset):
         return len(self.X) - self.seq_len
 
     def __getitem__(self, idx):
-        x_seq = self.X[idx: idx + self.seq_len]
+        x_seq = self.X[idx : idx + self.seq_len]
         y_val = self.y[idx + self.seq_len]
         if self.file_ids is not None:
             file_id = self.file_ids[idx + self.seq_len]
@@ -163,8 +172,8 @@ class PatchTST(nn.Module):
 # ---------------------------
 # 6. Training Setup and Loop with tqdm Logging
 # ---------------------------
-num_features = X_train.shape[1]
-patch_size = 2
+num_features = X_train.shape[1]  # now 4 features
+patch_size = 2  # (seq_len=10 / 2 = 5 patches)
 d_model = 128
 nhead = 4
 num_layers = 3
@@ -247,16 +256,16 @@ def plot_file_predictions(
     target_col="Orbit Mean Density (kg/m^3)",
     device=None,
 ):
-    # If no device is provided, get it from the model.
     if device is None:
         device = next(model.parameters()).device
 
+    # For plotting, we use the training features (log_Altitude is used for training)
     if selected_feature_columns is None:
         selected_feature_columns = [
             "MSIS Density (kg/m^3)",
-            "Latitude (deg)",
-            "Longitude (deg)",
-            "Altitude (km)"
+            #"Latitude (deg)",
+            #"Longitude (deg)",
+            "log_Altitude"
         ]
 
     file_data = data_raw[data_raw["file_id"] == file_id].copy()
@@ -265,7 +274,14 @@ def plot_file_predictions(
     num_features = len(selected_feature_columns)
     scaled_arrays = np.zeros((len(file_data), num_features))
     for col_i, col_name in enumerate(selected_feature_columns):
-        raw_vals = file_data[col_name].values
+        # For training, we use the log-transformed altitude.
+        if col_name == "log_Altitude":
+            # If not already computed, compute it here.
+            if "log_Altitude" not in file_data.columns:
+                file_data["log_Altitude"] = np.log10(file_data["Altitude (km)"])
+            raw_vals = file_data["log_Altitude"].values
+        else:
+            raw_vals = file_data[col_name].values
         scaled_arrays[:, col_i] = (raw_vals - X_mean[col_i]) / (X_std[col_i] + epsilon)
 
     predictions = []
@@ -276,7 +292,8 @@ def plot_file_predictions(
         model.eval()
         with torch.no_grad():
             pred_scaled = model(window_tensor)
-        pred = pred_scaled.cpu().item() * y_std[0] + y_mean[0]
+        # Inverse-scale the prediction then divide by target_factor.
+        pred = (pred_scaled.cpu().item() * y_std[0] + y_mean[0]) / target_factor
         predictions.append(pred)
         timestamps.append(file_data.iloc[i + seq_len]["Timestamp"])
 
@@ -324,4 +341,5 @@ plot_file_predictions(
     target_col=target_col,
     device=device
 )
+
 from IPython import embed; embed(); quit()

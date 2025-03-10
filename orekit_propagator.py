@@ -516,9 +516,9 @@ sat_config = {
 sim_config = {
     "min_step": 1e-6,
     "max_step": 100.0,
-    "init_step": 60.0,
+    "init_step": 5.0,
     "pos_tol": 1e-3,
-    "spherical_harmonics": (64, 64),
+    "spherical_harmonics": (4, 4),
 }
 
 # Paths for data handling
