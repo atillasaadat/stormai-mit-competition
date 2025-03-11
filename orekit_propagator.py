@@ -393,14 +393,6 @@ class SimulationRunner:
         # Update forecasted DataFrame with computed densities
         new_df = sat_density_truth.copy()
         new_df["MSIS Density (kg/m^3)"] = np.nan
-        new_df["Position X (km)"] = np.nan
-        new_df["Position Y (km)"] = np.nan
-        new_df["Position Z (km)"] = np.nan
-        new_df["Velocity X (km/s)"] = np.nan
-        new_df["Velocity Y (km/s)"] = np.nan
-        new_df["Velocity Z (km/s)"] = np.nan
-        new_df["Latitude (deg)"] = np.nan
-        new_df["Longitude (deg)"] = np.nan
         new_df["Altitude (km)"] = np.nan
         for ts, state, density in zip(timestamps_pd, states, densities):
             # Get the position and velocity from the state
@@ -412,20 +404,6 @@ class SimulationRunner:
 
             # Store density
             new_df.loc[new_df["Timestamp"] == ts, "MSIS Density (kg/m^3)"] = density
-            
-            # Convert position (m -> km) and store each component
-            new_df.loc[new_df["Timestamp"] == ts, "Position X (km)"] = pos.getX() * 1e-3
-            new_df.loc[new_df["Timestamp"] == ts, "Position Y (km)"] = pos.getY() * 1e-3
-            new_df.loc[new_df["Timestamp"] == ts, "Position Z (km)"] = pos.getZ() * 1e-3
-
-            # Convert velocity (m/s -> km/s) and store each component
-            new_df.loc[new_df["Timestamp"] == ts, "Velocity X (km/s)"] = vel.getX() * 1e-3
-            new_df.loc[new_df["Timestamp"] == ts, "Velocity Y (km/s)"] = vel.getY() * 1e-3
-            new_df.loc[new_df["Timestamp"] == ts, "Velocity Z (km/s)"] = vel.getZ() * 1e-3
-
-            # store each component of LLA
-            new_df.loc[new_df["Timestamp"] == ts, "Latitude (deg)"] =  math.degrees(lla.getLatitude())
-            new_df.loc[new_df["Timestamp"] == ts, "Longitude (deg)"] = math.degrees(lla.getLongitude())
             new_df.loc[new_df["Timestamp"] == ts, "Altitude (km)"] =  lla.getAltitude() * 1e-3
 
         #self.data_handler.save_propagated_results(self.file_id, new_df)
@@ -501,7 +479,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Flag to control overwriting output files.
-OVERWRITE = True  # Set to False to skip processing if output file exists
+OVERWRITE = False  # Set to False to skip processing if output file exists
 
 # Satellite and force model parameters
 sat_config = {
@@ -605,7 +583,7 @@ def process_file(file_id):
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # Required for Windows
 
-    workers = min(4, os.cpu_count() - 1)  # Adjust worker count based on CPU cores
+    workers = max(4, os.cpu_count() - 1)  # Adjust worker count based on CPU cores
     logger.info(f"Using {workers} worker processes for parallel processing.")
 
     # Create shared counter and lock for progress tracking
