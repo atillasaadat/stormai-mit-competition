@@ -20,17 +20,17 @@ Usage Example:
     )
     logger = logging.getLogger(__name__)
 
-    # Initialize DataHandler
-    dh = DataHandler(
-        logger,
-        omni2_folder=Path("./data/omni2"),
-        initial_state_folder=Path("./data/initial_state"),
-        sat_density_folder=Path("./data/sat_density"),
-        forcasted_omni2_folder=Path("./data/forcasted_omni2"),
-        sat_density_omni_forcasted_folder=Path("./data/sat_density_omni_forcasted"),
-        sat_density_omni_propagated_folder=Path("./data/sat_density_omni_propagated"),
-    )
-
+    # Initialize DataHandler with an initial state file:
+    DATA_PATHS = {
+        "omni2_folder": Path("/app/data/dataset/test/omni2"),
+        "initial_state_file": Path("/app/input_data/initial_states.csv"),
+        "sat_density_folder": Path("/app/data/dataset/test/sat_density"),
+        "forcasted_omni2_folder": Path("/app/data/dataset/test/forcasted_omni2"),
+        "sat_density_omni_forcasted_folder": Path("/app/data/dataset/test/sat_density_omni_forcasted"),
+        "sat_density_omni_propagated_folder": Path("/app/data/dataset/test/sat_density_omni_propagated"),
+    }
+    dh = DataHandler(logger, **DATA_PATHS)
+    
     # Example usage of DataHandler methods
     initial_state = dh.get_initial_state(file_id=1)
     omni_data = dh.read_csv_data(file_id=1, folder=dh.omni2_folder)
@@ -54,11 +54,12 @@ class DataHandler:
     def __init__(
         self, logger,
         omni2_folder,
-        initial_state_folder,
         sat_density_folder,
         forcasted_omni2_folder,
         sat_density_omni_forcasted_folder,
         sat_density_omni_propagated_folder,
+        initial_state_folder=None,
+        initial_state_file=None,
     ):
         """
         Initializes the DataHandler with the specified folders and logger.
@@ -66,7 +67,8 @@ class DataHandler:
         Args:
             logger (logging.Logger): Logger for logging messages.
             omni2_folder (Path): Path to the OMNI2 data folder.
-            initial_state_folder (Path): Path to the initial state data folder.
+            initial_state_folder (Path, optional): Path to the initial state data folder.
+            initial_state_file (Path, optional): Path to the initial state CSV file.
             sat_density_folder (Path): Path to the satellite density data folder.
             forcasted_omni2_folder (Path): Path to the forecasted OMNI2 data folder.
             sat_density_omni_forcasted_folder (Path): Path to the forecasted satellite density OMNI data folder.
@@ -74,24 +76,40 @@ class DataHandler:
         """
         self.logger = logger
         self.omni2_folder = omni2_folder
-        self.initial_state_folder = initial_state_folder
         self.sat_density_folder = sat_density_folder
         self.forcasted_omni2_folder = forcasted_omni2_folder
         self.sat_density_omni_forcasted_folder = sat_density_omni_forcasted_folder
         self.sat_density_omni_propagated_folder = sat_density_omni_propagated_folder
+        
+        # Use initial_state_file if provided; otherwise, use initial_state_folder.
+        if initial_state_file is not None:
+            self.initial_state_file = initial_state_file
+            self.initial_state_folder = None
+        else:
+            self.initial_state_folder = initial_state_folder
+            self.initial_state_file = None
+
         self.__read_initial_states()
 
     def __read_initial_states(self) -> None:
         """
-        Reads initial state data from CSV files in the initial_state_folder and concatenates them into a single DataFrame.
+        Reads initial state data from a single CSV file (if provided) or from all CSV files in the
+        initial_state_folder, and concatenates them into a single DataFrame.
         """
-        dataframes = []
-        for file in self.initial_state_folder.iterdir():
-            if file.suffix == ".csv":
-                df = pd.read_csv(file)
-                dataframes.append(df)
-        self.initial_states = pd.concat(dataframes, ignore_index=True)
-        self.logger.debug(f"Loaded initial state data with {len(self.initial_states)} rows.")
+        if self.initial_state_file is not None:
+            self.logger.debug(f"Loading initial states from file: {self.initial_state_file}")
+            self.initial_states = pd.read_csv(self.initial_state_file)
+        elif self.initial_state_folder is not None:
+            dataframes = []
+            for file in self.initial_state_folder.iterdir():
+                if file.suffix == ".csv":
+                    df = pd.read_csv(file)
+                    dataframes.append(df)
+            self.initial_states = pd.concat(dataframes, ignore_index=True)
+            self.logger.debug(f"Loaded initial state data from folder with {len(self.initial_states)} rows.")
+        else:
+            self.logger.error("No initial state source provided. Provide either initial_state_file or initial_state_folder.")
+            raise ValueError("No initial state source provided.")
 
     def get_initial_state(self, file_id):
         """

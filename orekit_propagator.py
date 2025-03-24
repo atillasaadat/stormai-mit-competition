@@ -45,7 +45,7 @@ from math import radians
 
 # Initialize the Orekit JVM
 orekit.initVM()
-setup_orekit_curdir(from_pip_library=True)
+setup_orekit_curdir(from_pip_library=False)
 
 # =============================================================================
 # Orbit Propagation Class
@@ -195,30 +195,32 @@ class PersistenceMSIS:
         self.all_space_weather_data = all_space_weather_data.copy()
 
     def run(self, dt, lon, lat, alt):
-        """
-        Runs the MSIS model for the given datetime and geodetic coordinates.
-        """
         index = (self.all_space_weather_data["Timestamp"] - dt).abs().idxmin()
         f107_daily = float(self.all_space_weather_data.iloc[index - 1]["f10.7_index"])
         ap_current = float(self.all_space_weather_data.iloc[index - 1]["ap_index_nT"])
 
-        # Prepare Ap indices
+        # Prepare Ap indices array
         aps = self.prepare_ap_indices(ap_current, index)
-        alt = alt / 1e3  # Convert to km
+        alt = alt / 1e3  # Convert altitude to km
+
         try:
+            # Use single list wrappers to ensure consistent dimensions
             result = msis.run(
-                dates=[[dt]],
-                lons=[[lon]],
-                lats=[[lat]],
-                alts=[[alt]],
-                f107s=[[f107_daily]],
+                dates=[dt],
+                lons=[lon],
+                lats=[lat],
+                alts=[alt],
+                f107s=[f107_daily],
                 aps=[aps],
             )
         except Exception as e:
             logger.error(f"Error running MSIS: {e}")
             raise
+
         density = result[0, 0]
-        self.logger.debug(f"Running MSIS for {dt} at lon={lon}, lat={lat}, alt={alt}, Ap : {aps}, f107={f107_daily}, density: {density}")
+        self.logger.debug(
+            f"Running MSIS for {dt} at lon={lon}, lat={lat}, alt={alt}, Ap: {aps}, f107={f107_daily}, density: {density}"
+        )
         return density
 
     def prepare_ap_indices(self, ap_current, index):
@@ -343,6 +345,9 @@ class SimulationRunner:
             4. Propagates the orbit.
             5. Matches computed densities with forecasted timestamps.
             6. Saves the output.
+
+        If sat_density_truth is None, a propagation timeline is generated from the initial
+        state epoch to +3 days in 10-minute intervals.
         """
         logger.info(f"Starting simulation for File ID {file_id:05d}.")
 
@@ -383,30 +388,41 @@ class SimulationRunner:
             mu,
         )
 
-        # Propagate the orbit
+        # Create the propagator
         propagator = OrbitPropagator(initial_orbit, atmosphere, self.sat_config, self.sim_config)
+
+        # If sat_density_truth is None, generate propagation timestamps from initial_date to +3 days at 10-minute intervals.
+        if sat_density_truth is None:
+            start = pd.to_datetime(initial_state["Timestamp"])
+            end = start + pd.Timedelta(days=3)
+            timestamps_range = pd.date_range(start=start, end=end, freq="10min")
+            sat_density_truth = pd.DataFrame({"Timestamp": timestamps_range})
+        
+        # Propagate the orbit using the provided or generated timeline
         timestamps, states, densities = propagator.propagate(sat_density_truth)
 
         # Convert Orekit AbsoluteDate timestamps to pandas datetime
         timestamps_pd = [pd.to_datetime(ts.toString(0)).tz_localize(None) for ts in timestamps]
 
-        # Update forecasted DataFrame with computed densities
+        # Update the DataFrame with computed densities and geolocation values
         new_df = sat_density_truth.copy()
         new_df["MSIS Density (kg/m^3)"] = np.nan
+        new_df["Latitude (deg)"] = np.nan
+        new_df["Longitude (deg)"] = np.nan
         new_df["Altitude (km)"] = np.nan
         for ts, state, density in zip(timestamps_pd, states, densities):
             # Get the position and velocity from the state
             pv = state.getPVCoordinates()
             pos = pv.getPosition()
-            vel = pv.getVelocity()
-            
+            # Transform position to geodetic coordinates
             lla = atmosphere.earth.transform(pos, atmosphere.itrf, state.getDate())
 
-            # Store density
+            # Store density and geodetic coordinates using the timestamp as key
             new_df.loc[new_df["Timestamp"] == ts, "MSIS Density (kg/m^3)"] = density
-            new_df.loc[new_df["Timestamp"] == ts, "Altitude (km)"] =  lla.getAltitude() * 1e-3
+            new_df.loc[new_df["Timestamp"] == ts, "Latitude (deg)"] = math.degrees(lla.getLatitude())
+            new_df.loc[new_df["Timestamp"] == ts, "Longitude (deg)"] = math.degrees(lla.getLongitude())
+            new_df.loc[new_df["Timestamp"] == ts, "Altitude (km)"] = lla.getAltitude() * 1e-3
 
-        #self.data_handler.save_propagated_results(self.file_id, new_df)
         return new_df
 
 
@@ -474,74 +490,57 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pymsis.utils")
 
 
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Flag to control overwriting output files.
-OVERWRITE = False  # Set to False to skip processing if output file exists
 
-# Satellite and force model parameters
-sat_config = {
-    "satellite_mass_kg": 100.0,  # kg
-    "cross_section_m2": 1.0,  # m^2
-    "srp_area_m2": 1.0,  # m^2
-    "drag_coeff": 2.2,
-    "cr": 1.0,
-}
-
-# Integrator tolerances and step sizes
-sim_config = {
-    "min_step": 1e-6,
-    "max_step": 100.0,
-    "init_step": 5.0,
-    "pos_tol": 1e-3,
-    "spherical_harmonics": (4, 4),
-}
-
-# Paths for data handling
-data_paths = {
-    "omni2_folder": Path("./data/omni2"),
-    "initial_state_folder": Path("./data/initial_state"),
-    "sat_density_folder": Path("./data/sat_density"),
-    "forcasted_omni2_folder": Path("./data/forcasted_omni2"),
-    "sat_density_omni_forcasted_folder": Path("./data/sat_density_omni_forcasted"),
-    "sat_density_omni_propagated_folder": Path("./data/sat_density_omni_propagated"),
-}
-
-# Get file IDs
-dh = DataHandler(logger, **data_paths)
-all_file_ids = sorted(dh.get_all_file_ids_from_folder(dh.sat_density_folder))
-total_files = len(all_file_ids)
-logger.info(f"Total files to process: {total_files}, [{all_file_ids[0]} - {all_file_ids[-1]}]")
-
-def pool_init(shared_counter, lock):
-    """Initialize Orekit JVM in each worker process and share progress counter."""
+def pool_init(shared_counter, lock, data_paths_, sat_config_, sim_config_, overwrite_flag, total_files_):
+    """Initialize Orekit JVM and set global configuration for each worker process."""
     import orekit
     from orekit.pyhelpers import setup_orekit_curdir
 
-    # Start Orekit VM in each process
+    # Initialize Orekit VM in each process
     orekit.initVM()
-    setup_orekit_curdir(from_pip_library=True)
+    setup_orekit_curdir(filename="orekit-data.zip", from_pip_library=False)
+
+    # Set globals for worker processes
+    global data_paths, sat_config, sim_config, OVERWRITE, total_files, completed_files, counter_lock
+    data_paths = data_paths_
+    sat_config = sat_config_
+    sim_config = sim_config_
+    OVERWRITE = overwrite_flag
+    total_files = total_files_
 
     # Make shared counter accessible
-    global completed_files, counter_lock
     completed_files = shared_counter
     counter_lock = lock
-
+    
 def process_file(file_id):
     """Process a single file in parallel with progress tracking and optional skipping."""
     try:
         logger = logging.getLogger(__name__)
 
-        # Create local instances in each worker process
+        # Create local instances in each worker process using global configuration
         dh_worker = DataHandler(logger, **data_paths)
         sim_worker = SimulationRunner(logger, sat_config, sim_config)
 
-        # Construct the output file path (assuming a CSV file is created with the file_id as name)
-        output_file = dh_worker.sat_density_omni_propagated_folder / f"{file_id}.csv"
-        if not OVERWRITE and output_file.exists():
-            logger.info(f"Skipping {file_id} as output file already exists.")
+        # Determine the expected output filename based on the copy folder.
+        file_id_str = f"{file_id:05d}"
+        output_file = None
+        for file in dh_worker.sat_density_folder.iterdir():
+            if file.suffix == ".csv" and file_id_str in file.stem:
+                output_file = file.name
+                break
+        if output_file is None:
+            raise FileNotFoundError(f"Could not locate forecast file for File ID {file_id}")
+
+        output_path = dh_worker.sat_density_omni_propagated_folder / output_file
+
+        # Overwrite check using the correct output filename.
+        if not OVERWRITE and output_path.exists():
+            logger.info(f"Skipping {file_id} as output file {output_path} already exists.")
             with counter_lock:
                 completed_files.value += 1
                 progress = (completed_files.value / total_files) * 100
@@ -551,7 +550,9 @@ def process_file(file_id):
         # Load input data
         initial_state = dh_worker.get_initial_state(file_id)
         omni_data = dh_worker.read_csv_data(file_id, dh_worker.omni2_folder)
-        sat_density_truth = dh_worker.read_csv_data(file_id, dh_worker.sat_density_folder)
+        sat_density_truth = None
+        if dh_worker.sat_density_folder is not None:
+            sat_density_truth = dh_worker.read_csv_data(file_id, dh_worker.sat_density_folder)
 
         # Run simulation
         density_results = sim_worker.run_simulation(
@@ -561,7 +562,7 @@ def process_file(file_id):
             sat_density_truth=sat_density_truth,
         )
 
-        # Save the simulation results
+        # Save the simulation results (this will use the same naming convention)
         dh_worker.save_df_from_copy_folder_path(
             file_id,
             density_results,
@@ -580,18 +581,67 @@ def process_file(file_id):
         logger.error(f"Error processing file {file_id}: {e}")
         return f"[{file_id}] ERROR"
 
+    
 if __name__ == "__main__":
     multiprocessing.freeze_support()  # Required for Windows
 
-    workers = max(4, os.cpu_count() - 1)  # Adjust worker count based on CPU cores
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    # Define OVERWRITE flag and configuration inside __main__
+    OVERWRITE = False  # Set to False to skip processing if output file exists
+
+    # Satellite and force model parameters
+    sat_config = {
+        "satellite_mass_kg": 100.0,  # kg
+        "cross_section_m2": 1.0,     # m^2
+        "srp_area_m2": 1.0,          # m^2
+        "drag_coeff": 2.2,
+        "cr": 1.0,
+    }
+
+    # Integrator tolerances and step sizes
+    sim_config = {
+        "min_step": 1e-6,
+        "max_step": 100.0,
+        "init_step": 5.0,
+        "pos_tol": 1e-3,
+        "spherical_harmonics": (4, 4),
+    }
+
+    # Paths for data handling
+    data_paths = {
+        "omni2_folder": Path("./data/omni2"),
+        "initial_state_folder": Path("./data/initial_state"),
+        "sat_density_folder": Path("./data/sat_density"),
+        "forcasted_omni2_folder": Path("./data/forcasted_omni2"),
+        "sat_density_omni_forcasted_folder": Path("./data/sat_density_omni_forcasted"),
+        "sat_density_omni_propagated_folder": Path("./data/sat_density_omni_propagated"),
+    }
+
+    # Get file IDs
+    dh = DataHandler(logger, **data_paths)
+    all_file_ids = sorted(dh.get_all_file_ids_from_folder(dh.sat_density_folder))
+    total_files = len(all_file_ids)
+    logger.info(f"Total files to process: {total_files}, [{all_file_ids[0]} - {all_file_ids[-1]}]")
+
+    # Use multiprocessing Pool to process each file_id in parallel.
+    workers = max(4, os.cpu_count() - 1)
     logger.info(f"Using {workers} worker processes for parallel processing.")
 
-    # Create shared counter and lock for progress tracking
     with multiprocessing.Manager() as manager:
-        shared_counter = manager.Value("i", 0)  # Shared counter for progress tracking
-        lock = manager.Lock()  # Lock for atomic counter updates
+        shared_counter = manager.Value("i", 0)
+        lock = manager.Lock()
 
-        with multiprocessing.Pool(workers, initializer=pool_init, initargs=(shared_counter, lock)) as pool:
+        # Set the multiprocessing start method to "spawn" for clean process creation.
+        multiprocessing.set_start_method("spawn", force=True)
+
+        with multiprocessing.Pool(
+            workers,
+            initializer=pool_init,
+            initargs=(shared_counter, lock, data_paths, sat_config, sim_config, OVERWRITE, total_files)
+        ) as pool:
             results = pool.map(process_file, all_file_ids)
 
         for result in results:

@@ -339,7 +339,7 @@ def run_predictions_from_csv(csv_filepath,
 # ---------------------------
 # Main Function
 # ---------------------------
-def main():
+if __name__ == "__main__":
     # Configuration variables declared in main
     DATA_PATHS = {
         "omni2_folder": Path("./data/omni2"),
@@ -349,12 +349,12 @@ def main():
         "sat_density_omni_forcasted_folder": Path("./data/sat_density_omni_forcasted"),
         "sat_density_omni_propagated_folder": Path("./data/sat_density_omni_propagated"),
     }
-    FILE_USAGE_PERCENT = 0.8
+    FILE_USAGE_PERCENT = 0.5
     TARGET_COL = "Orbit Mean Density (kg/m^3)"
-    SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "log_Altitude"]
+    SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]
     SEQ_LEN = 10
     SPLIT_RATIO = 0.8
-    TARGET_FACTOR = 1e12
+    TARGET_FACTOR = 1e-12
     EPSILON = 1e-8
 
     # Setup logger (if desired, you can configure logging here as well)
@@ -390,7 +390,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
 
-    num_epochs = 10
+    num_epochs = 15
     for epoch in range(num_epochs):
         train_model_fn(model, train_loader, optimizer, criterion, device, epoch)
         rmse_avg, rmse_overall = evaluate_model_fn(model, test_loader, criterion, device)
@@ -401,14 +401,10 @@ def main():
     logger.info(f"Final Test RMSE (overall): {rmse_overall:.6f}")
 
     # Save the trained model
-    model_save_path = Path("patchtst_model.pth")
+    model_save_path = Path("density_prediction_patchtst_model.pth")
     torch.save(model.state_dict(), model_save_path)
     logger.info(f"Model saved to {model_save_path}")
 
     # Optionally, plot predictions for a random test file.
-    plot_random_file_id(file_ids_test, data_raw, model, SEQ_LEN, X_mean, X_std, y_mean, y_std,
-                        TARGET_FACTOR, EPSILON, SELECTED_FEATURE_COLUMNS, TARGET_COL, device)
-
-if __name__ == "__main__":
-    main()
+    plot_random_file_id(file_ids_test, data_raw, model, SEQ_LEN, X_mean, X_std, y_mean, y_std, TARGET_FACTOR, EPSILON, SELECTED_FEATURE_COLUMNS, TARGET_COL, device)
     from IPython import embed; embed(); quit()

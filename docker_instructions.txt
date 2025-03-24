@@ -1,0 +1,11 @@
+docker run --rm `
+    --name my-test-submission `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/data/:/app/data/dataset/test `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/ingested_program `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/output `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/data/initial_state:/app/input_data `
+    -it arclabmit/ai-challenges:micromamba-submission
+
+yes | micromamba env create --name sub_env --file /app/ingested_program/environment.yml
+
+micromamba run --name sub_env python submission.py
