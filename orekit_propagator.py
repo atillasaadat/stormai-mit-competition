@@ -96,7 +96,7 @@ class OrbitPropagator:
         itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
         r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS
         earth = OneAxisEllipsoid(r_Earth, Constants.IERS2010_EARTH_FLATTENING, itrf)
-        mu = Constants.IERS2010_EARTH_MU
+        # mu = Constants.IERS2010_EARTH_MU
 
         # Initial spacecraft state
         initial_date = self.initial_orbit.getDate()
@@ -116,9 +116,9 @@ class OrbitPropagator:
 
         # --- Add force models ---
         # 1. Solar Radiation Pressure
-        srp_model = IsotropicRadiationSingleCoefficient(self.sat_config["srp_area_m2"], self.sat_config["cr"])
-        srp_provider = SolarRadiationPressure(sun, earth, srp_model)
-        propagator.addForceModel(srp_provider)
+        # srp_model = IsotropicRadiationSingleCoefficient(self.sat_config["srp_area_m2"], self.sat_config["cr"])
+        # srp_provider = SolarRadiationPressure(sun, earth, srp_model)
+        # propagator.addForceModel(srp_provider)
 
         # 2. Gravity Force using Holmes-Featherstone model
         gravity_provider = GravityFieldFactory.getConstantNormalizedProvider(self.sim_config['spherical_harmonics'][0], 
@@ -128,52 +128,47 @@ class OrbitPropagator:
         propagator.addForceModel(gravity_force)
 
         # 3. Solid Tides
-        solid_tides_bodies = ArrayList().of_(CelestialBody)
-        solid_tides_bodies.add(sun)
-        solid_tides_bodies.add(moon)
-        solid_tides = SolidTides(
-            earth.getBodyFrame(),
-            gravity_provider.getAe(),
-            gravity_provider.getMu(),
-            gravity_provider.getTideSystem(),
-            IERSConventions.IERS_2010,
-            TimeScalesFactory.getUT1(IERSConventions.IERS_2010, True),
-            solid_tides_bodies.toArray(),
-        )
-        propagator.addForceModel(solid_tides)
+        # solid_tides_bodies = ArrayList().of_(CelestialBody)
+        # solid_tides_bodies.add(sun)
+        # solid_tides_bodies.add(moon)
+        # solid_tides = SolidTides(
+        #     earth.getBodyFrame(),
+        #     gravity_provider.getAe(),
+        #     gravity_provider.getMu(),
+        #     gravity_provider.getTideSystem(),
+        #     IERSConventions.IERS_2010,
+        #     TimeScalesFactory.getUT1(IERSConventions.IERS_2010, True),
+        #     solid_tides_bodies.toArray(),
+        # )
+        # propagator.addForceModel(solid_tides)
 
-        # 4. Third Body Attractions (Sun and Moon)
-        propagator.addForceModel(ThirdBodyAttraction(sun))
-        propagator.addForceModel(ThirdBodyAttraction(moon))
+        # # 4. Third Body Attractions (Sun and Moon)
+        # propagator.addForceModel(ThirdBodyAttraction(sun))
+        # propagator.addForceModel(ThirdBodyAttraction(moon))
 
         # 5. Drag Force using custom atmospheric model
         drag_model = IsotropicDrag(self.sat_config["cross_section_m2"], self.sat_config["drag_coeff"])
         drag_force = DragForce(self.atmosphere, drag_model)
         propagator.addForceModel(drag_force)
 
-        # Propagate over the entire timespan
-        states = []
-        logger.debug(f"Beginning orbit propagation over {len(tspan)} time steps.")
-        tic = time.time()
-        progress_interval = max(1, len(tspan) // 20)  # Calculate interval for 5% progress
-        for idx, current_date in enumerate(tspan):
-            if idx % progress_interval == 0:
-                progress = (idx / len(tspan)) * 100
-                logger.debug(f"Propagation progress: {progress:.1f}%")
-            logger.debug(f"Propagating to {current_date} ({idx + 1}/{len(tspan)})")
-            state = propagator.propagate(current_date)
-            states.append(state)
-        toc = time.time()
-        logger.debug(f"Propagation completed in {toc - tic:.3f} seconds.")
-        logger.debug("Propagation progress: 100.0%")
+        # Pre-allocate list lengths.
+        n_steps = len(tspan)
+        states = [None] * n_steps
+        densities = [0.0] * n_steps
 
-        # Compute atmospheric densities for each propagated state
-        densities = []
-        for state in states:
+        logger.debug(f"Beginning propagation over {n_steps} time steps.")
+        tic = time.time()
+        for idx, current_date in enumerate(tspan):
+            # Remove per-step logging to reduce overhead.
+            state = propagator.propagate(current_date)
             density = self.atmosphere.getDensity(
                 state.getDate(), state.getPVCoordinates().getPosition(), state.getFrame()
             )
-            densities.append(float(density))
+            states[idx] = state
+            densities[idx] = float(density)
+        toc = time.time()
+        logger.debug(f"Propagation completed in {toc - tic:.3f} seconds.")
+
 
         # (Optional: trajectory plotting code could be added here)
         return tspan, states, densities
@@ -192,7 +187,7 @@ class PersistenceMSIS:
         Initialize the persistence model by combining historical and forecasted data.
         """
         self.logger = logger
-        self.all_space_weather_data = all_space_weather_data.copy()
+        self.all_space_weather_data = all_space_weather_data
 
     def run(self, dt, lon, lat, alt):
         index = (self.all_space_weather_data["Timestamp"] - dt).abs().idxmin()
@@ -394,15 +389,24 @@ class SimulationRunner:
         # If sat_density_truth is None, generate propagation timestamps from initial_date to +3 days at 10-minute intervals.
         if sat_density_truth is None:
             start = pd.to_datetime(initial_state["Timestamp"])
+            if start.tzinfo is None:
+                start = start.tz_localize("UTC")
             end = start + pd.Timedelta(days=3)
-            timestamps_range = pd.date_range(start=start, end=end, freq="10min")
+            timestamps_range = pd.date_range(start=start, end=end, freq="10min", tz="UTC")
             sat_density_truth = pd.DataFrame({"Timestamp": timestamps_range})
         
         # Propagate the orbit using the provided or generated timeline
         timestamps, states, densities = propagator.propagate(sat_density_truth)
 
         # Convert Orekit AbsoluteDate timestamps to pandas datetime
-        timestamps_pd = [pd.to_datetime(ts.toString(0)).tz_localize(None) for ts in timestamps]
+        timestamps_pd = []
+        for ts in timestamps:
+            ts_parsed = pd.to_datetime(ts.toString(0))
+            if ts_parsed.tzinfo is None:
+                ts_utc = ts_parsed.tz_localize("UTC")
+            else:
+                ts_utc = ts_parsed.tz_convert("UTC")
+            timestamps_pd.append(ts_utc)
 
         # Update the DataFrame with computed densities and geolocation values
         new_df = sat_density_truth.copy()
@@ -603,10 +607,10 @@ if __name__ == "__main__":
 
     # Integrator tolerances and step sizes
     sim_config = {
-        "min_step": 1e-6,
+        "min_step": 1e-3,
         "max_step": 100.0,
-        "init_step": 5.0,
-        "pos_tol": 1e-3,
+        "init_step": 10.0,
+        "pos_tol": 1e-2,
         "spherical_harmonics": (4, 4),
     }
 
