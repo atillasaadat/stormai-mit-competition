@@ -1,5 +1,6 @@
 docker run --rm `
     --name my-test-submission `
+    --gpus all `
     -v C:/Users/Atilla/Documents/stormai-mit-competition/data/:/app/data/dataset/test `
     -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/ingested_program `
     -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/output `
@@ -9,3 +10,15 @@ docker run --rm `
 yes | micromamba env create --name sub_env --file /app/ingested_program/environment.yml
 
 micromamba run --name sub_env python submission.py
+
+#test
+
+docker run --rm `
+    --name my-test-submission `
+    --gpus all `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/data/:/app/data/dataset/test `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/ingested_program `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/:/app/output `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/data/initial_state:/app/input_data `
+    -v C:/Users/Atilla/Documents/stormai-mit-competition/data/sat_density:/app/sat_density `
+    -it arclabmit/ai-challenges:micromamba-submission
