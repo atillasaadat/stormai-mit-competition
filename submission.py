@@ -1,16 +1,11 @@
 """
 Combined simulation propagation and model prediction pipeline.
 
-This script:
-  1. Loads the space weather (OMNI2) data and initial state.
-  2. Uses our J₂/pyMSIS propagation to generate a dataframe that includes computed MSIS density and geolocation info.
-  3. Prepares the propagated dataframe by computing additional features (e.g. log_Altitude).
-  4. Loads a pre-trained PyTorch model (saved in a .pth file) and uses it to predict the correction ratio
-     (true density / MSIS density) over a sliding window. The predicted ratio is multiplied by the MSIS density
-     to yield the corrected density.
-  5. Runs the pipeline for every file_id in parallel (or sequentially). Each process updates the shared
-     prediction.json file as soon as it finishes processing its file.
-  6. If the overall runtime exceeds 7140 seconds, processing stops and the current results are saved.
+This version includes optimizations:
+  1. Vectorized model prediction using batch processing.
+  2. Reduced redundant MSIS calls in propagation (one call per integration step).
+  3. Batched file update: Each process returns its results, which are merged in memory,
+     and then the output JSON is written only once at the end.
 """
 
 import os
@@ -41,15 +36,11 @@ from datahandler import DataHandler
 # J2/pyMSIS Propagation Functions
 # ---------------------------
 
-# Constants
 MU = 3.986004418e14       # [m^3/s^2]
 R_E = 6378137.0           # [m]
-
-# Transformer: ECEF to WGS84 geodetic
 ecef_to_geo = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
 
 def oe2rv(a_km, e, i_deg, raan_deg, argp_deg, nu_deg):
-    """Convert orbital elements (km, deg) to ECI state vectors (m, m/s)."""
     i = math.radians(i_deg)
     raan = math.radians(raan_deg)
     argp = math.radians(argp_deg)
@@ -79,14 +70,12 @@ def oe2rv(a_km, e, i_deg, raan_deg, argp_deg, nu_deg):
     return r_eci, v_eci
 
 def gmst(dt):
-    """Compute approximate GMST (radians) for a given datetime (UTC)."""
     JD = (dt - datetime(2000, 1, 1, 12)).total_seconds()/86400.0 + 2451545.0
     GMST_hours = 18.697374558 + 24.06570982441908 * (JD - 2451545.0)
     GMST_hours %= 24.0
     return (GMST_hours / 24.0) * 2 * math.pi
 
 def eci_to_ecef(r_eci, current_time):
-    """Convert an ECI state vector (m) to ECEF coordinates using GMST rotation."""
     theta = gmst(current_time)
     cos_theta = math.cos(-theta)
     sin_theta = math.sin(-theta)
@@ -96,10 +85,6 @@ def eci_to_ecef(r_eci, current_time):
     return R @ r_eci
 
 def get_density(current_time, r_eci, f107_daily, aps):
-    """
-    Convert current ECI position to geodetic (via ECEF) and call pymsis to obtain density.
-    MSIS expects altitude in km.
-    """
     r_ecef = eci_to_ecef(r_eci, current_time)
     x, y, z = r_ecef
     lon, lat, alt_m = ecef_to_geo.transform(x, y, z)
@@ -164,10 +149,10 @@ def rk4_step(r, v, density, dt, mass, Cd, A):
     v_new = v + (dt/6.0) * (k1_v + 2*k2_v + 2*k3_v + k4_v)
     return r_new, v_new
 
-def propagate_orbit(r0, v0, t0, dt, steps, mass, Cd, A, f107_daily, aps):
+def propagate_orbit(r0, v0, t0, dt, steps, mass, Cd, A, f107_daily, aps, use_single_density=True):
     """
     Propagate the orbit using RK4 integration.
-    Returns lists of timestamps, state vectors, and densities.
+    If use_single_density=True then get_density is only called once per time step.
     """
     times = [t0]
     states = [np.hstack((r0, v0))]
@@ -182,20 +167,20 @@ def propagate_orbit(r0, v0, t0, dt, steps, mass, Cd, A, f107_daily, aps):
         current_time = current_time + timedelta(seconds=dt)
         times.append(current_time)
         states.append(np.hstack((r, v)))
-        densities.append(get_density(current_time, r, f107_daily, aps))
+        if use_single_density:
+            densities.append(density)
+        else:
+            densities.append(get_density(current_time, r, f107_daily, aps))
     return times, np.array(states), densities
 
 def eci_to_lla(r_eci, current_time):
-    """
-    Convert an ECI state vector to geodetic latitude, longitude, and altitude (km).
-    """
     r_ecef = eci_to_ecef(r_eci, current_time)
     x, y, z = r_ecef
     lon, lat, alt_m = ecef_to_geo.transform(x, y, z)
     return lat, lon, alt_m/1000.0
 
 # ---------------------------
-# Model Definition (as used in training)
+# Model Definition
 # ---------------------------
 class PatchTST(nn.Module):
     def __init__(self, seq_len, patch_size, num_features, d_model, nhead, num_layers, dropout=0.1):
@@ -218,13 +203,9 @@ class PatchTST(nn.Module):
         return torch.relu(out)
 
 # ---------------------------
-# Prediction function using a dataframe
+# Prediction function with batched prediction
 # ---------------------------
 def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon=1e-8, scaling_params=None):
-    """
-    Given a propagated dataframe, scale the features and run a sliding-window prediction.
-    Returns ISO-format timestamps and predicted orbit densities.
-    """
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df.sort_values("Timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -239,57 +220,29 @@ def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon
         X_std = np.array(scaling_params["X_std"])
     X_scaled = (X_input - X_mean) / (X_std + epsilon)
     
-    predictions = []
-    pred_timestamps = []
     num_windows = len(X_scaled) - seq_len
-    device = next(model.parameters()).device
-
-    for i in range(num_windows):
-        window = X_scaled[i:i+seq_len]
-        window_tensor = torch.FloatTensor(window).unsqueeze(0).to(device)
-        model.eval()
-        with torch.no_grad():
-            pred_ratio = model(window_tensor).cpu().item()
-        msis_val = df.iloc[i+seq_len]["MSIS Density (kg/m^3)"]
-        pred_density = pred_ratio * msis_val
-        predictions.append(float(pred_density))
-        ts = df.iloc[i+seq_len]["Timestamp"]
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        pred_timestamps.append(ts.isoformat())
+    # Build a 3D array of shape (num_windows, seq_len, features)
+    windows = np.array([X_scaled[i:i+seq_len] for i in range(num_windows)])
     
-    return pred_timestamps, predictions
-
-# ---------------------------
-# Function to safely update the shared prediction.json file.
-# ---------------------------
-def update_prediction_file(result_dict, output_path, file_lock):
-    """Safely update the JSON file using file_lock."""
-    with file_lock:
-        if output_path.exists():
-            with open(output_path, "r") as f:
-                try:
-                    current_data = json.load(f)
-                except json.JSONDecodeError:
-                    current_data = {}
-        else:
-            current_data = {}
-        current_data.update(result_dict)
-        with open(output_path, "w") as f:
-            json.dump(current_data, f, indent=4)
+    device = next(model.parameters()).device
+    window_tensor = torch.FloatTensor(windows).to(device)
+    model.eval()
+    with torch.no_grad():
+        pred_ratios = model(window_tensor).cpu().numpy().flatten()
+    
+    msis_vals = df.iloc[seq_len:]["MSIS Density (kg/m^3)"].values
+    pred_densities = pred_ratios * msis_vals
+    pred_timestamps = df.iloc[seq_len:]["Timestamp"].apply(
+        lambda ts: ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    ).apply(lambda ts: ts.isoformat()).tolist()
+    
+    return pred_timestamps, pred_densities.tolist()
 
 # ---------------------------
 # Per-file processing function
 # ---------------------------
-def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon, scaling_params, propagation_params, output_path, file_lock):
-    """
-    Process a single file:
-      - Load initial state and OMNI2 data.
-      - Use J₂/pyMSIS propagation to build a propagated DataFrame.
-      - Run prediction.
-      - Update the shared prediction.json file.
-      - Return the result dictionary.
-    """
+def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
+                 scaling_params, propagation_params):
     try:
         logger = logging.getLogger(__name__)
         file_id_str = f"{file_id:05d}"
@@ -321,7 +274,9 @@ def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
         mass = propagation_params["mass"]
         Cd = propagation_params["Cd"]
         A = propagation_params["A"]
-        times_fine, states_fine, densities_fine = propagate_orbit(r0, v0, t0, dt_integ, steps_integ, mass, Cd, A, f107, aps)
+        times_fine, states_fine, densities_fine = propagate_orbit(
+            r0, v0, t0, dt_integ, steps_integ, mass, Cd, A, f107, aps, use_single_density=True
+        )
         sample_rate = propagation_params["sample_rate"]
         times_prop = times_fine[::sample_rate]
         states_prop = states_fine[::sample_rate]
@@ -348,70 +303,38 @@ def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
             propagated_df, model, seq_len, selected_feature_columns, epsilon, scaling_params
         )
 
-        result_dict = {str(file_id): {"Timestamp": pred_timestamps, "Orbit Mean Density (kg/m^3)": predicted_densities}}
-        update_prediction_file(result_dict, output_path, file_lock)
+        result_dict = {str(file_id): {"Timestamp": pred_timestamps,
+                                      "Orbit Mean Density (kg/m^3)": predicted_densities}}
         process_file_end_time = time.time()
         logger.info(f"File {file_id_str}: Result saved. Time: {process_file_end_time - process_file_start_time:.3f} [s]")
-        is_plot = False
-        if is_plot and dh.sat_density_folder:
-            plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine, output_dir="./result_plots")
-
+        plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine)
         return result_dict
     except Exception as e:
         logger.error(f"Error processing file ID {file_id:05d}: {e}")
         return {str(file_id): {"error": str(e)}}
 
+# ---------------------------
+# Plotting function (unchanged)
+# ---------------------------
 def plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine, output_dir="./result_plots"):
-    """
-    Create a high-resolution (1080p) plot of orbit mean density versus time.
-    The plot includes:
-      - MSIS Orbit Mean Density from fine propagation (times_fine, densities_fine)
-      - Predicted Orbit Mean Density from result_dict
-      - Truth Orbit Mean Density from the DataHandler (dh)
-    
-    The plot is saved as a PNG file to output_dir with filename {file_id}.png.
-    
-    Inputs:
-      file_id         : ID of the file (used as a key in result_dict)
-      result_dict     : Dictionary with predicted results for file_id; must have keys:
-                        "Timestamp" and "Orbit Mean Density (kg/m^3)"
-      dh              : DataHandler instance to read truth data.
-      times_fine      : List of timestamps from fine propagation.
-      densities_fine  : List/array of densities from fine propagation.
-      output_dir      : Directory to save the plot (default "./result_plots")
-    """
-    # Ensure output directory exists.
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Convert predicted timestamps to datetime.
     pred_timestamps = pd.to_datetime(result_dict[str(file_id)]["Timestamp"])
     pred_density = result_dict[str(file_id)]["Orbit Mean Density (kg/m^3)"]
-    
-    # Read truth data and filter out invalid densities.
     truth_df = dh.read_csv_data(file_id, dh.sat_density_folder)
     truth_df = truth_df[truth_df["Orbit Mean Density (kg/m^3)"] != 9.99e+32]
     truth_df["Timestamp"] = pd.to_datetime(truth_df["Timestamp"])
-    
-    # Create a high-resolution figure (1080p: 1920x1080 pixels)
     fig, ax = plt.subplots(figsize=(19.2, 10.8), dpi=100)
-    
-    # Plot MSIS orbit density (from fine propagation)
     ax.plot(times_fine, densities_fine, label="MSIS Orbit Mean Density", linewidth=2)
-    # Plot predicted orbit density
     ax.plot(pred_timestamps, pred_density, label="Predicted Orbit Mean Density", linewidth=2)
-    # Plot truth orbit density
     ax.plot(truth_df["Timestamp"], truth_df["Orbit Mean Density (kg/m^3)"],
             label="Truth Orbit Mean Density", linewidth=2)
-    
     ax.set_xlabel("Timestamp", fontsize=14)
     ax.set_ylabel("Orbit Mean Density (kg/m^3)", fontsize=14)
     ax.set_title("Orbit Mean Density vs Time", fontsize=16)
     ax.legend(fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    
-    # Save the figure to a file with the filename {file_id}.png in output_dir.
     output_file = output_dir / f"{file_id}.png"
     plt.savefig(str(output_file))
     plt.close(fig)
@@ -429,20 +352,17 @@ def main():
     
     os.environ["MSIS_DATA_DIR"] = "/app/ingested_program/src/msis2.0"
     
-    # ---------------------------
-    # Input Parameters and Constants Initialization
-    # ---------------------------
     DATA_PATHS = {
         "omni2_folder": Path("/app/data/dataset/test/omni2"),
         "initial_state_file": Path("/app/input_data/initial_states.csv"),
-        "sat_density_folder": None,
-        #"sat_density_folder": Path("/app/sat_density"),
+        #"sat_density_folder": None,
+        "sat_density_folder": Path("/app/sat_density"),
         "forcasted_omni2_folder": Path("/app/data/dataset/test/forcasted_omni2"),
         "sat_density_omni_forcasted_folder": Path("/app/data/dataset/test/sat_density_omni_forcasted"),
         "sat_density_omni_propagated_folder": Path("/app/data/dataset/test/sat_density_omni_propagated"),
     }
     
-    seq_len = 10
+    seq_len = 60
     SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]
     EPSILON = 1e-8
     scaling_file = Path("scaling_params.json")
@@ -452,30 +372,26 @@ def main():
     else:
         scaling_params = None
     
-    dt_integ = 150.0           # Integration time step in seconds (can be changed dynamically)
+    dt_integ = 30.0
     total_seconds = 3 * 86400   # 3 days propagation
     steps_integ = int(total_seconds / dt_integ)
-    sample_rate = int(600 / dt_integ)  # Ensure downsampled timestamps are at 10-minute intervals.
+    sample_rate = int(600 / dt_integ)
     PROPAGATION_PARAMS = {
         "dt_integ": dt_integ,
         "steps_integ": steps_integ,
-        "mass": 100.0,        # Satellite mass in kg
-        "Cd": 2.2,            # Drag coefficient
-        "A": 1.0,             # Cross-sectional area (m^2)
+        "mass": 100.0,
+        "Cd": 2.2,
+        "A": 1.0,
         "sample_rate": sample_rate
     }
     
     MODEL_PATH = Path("density_prediction_patchtst_model.pth")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PatchTST(seq_len=seq_len, patch_size=2, num_features=len(SELECTED_FEATURE_COLUMNS),
+    model = PatchTST(seq_len=seq_len, patch_size=5, num_features=len(SELECTED_FEATURE_COLUMNS),
                       d_model=128, nhead=4, num_layers=3)
     model.to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
-    
-    # ---------------------------
-    # End of parameters initialization
-    # ---------------------------
     
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger("Main")
@@ -486,48 +402,43 @@ def main():
     logger.info(f"Found {total_files} file IDs to process.")
     
     output_path = Path("/app/output/prediction.json")
-    # Use a Manager to create a shared lock.
-    with multiprocessing.Manager() as manager:
-        file_lock = manager.Lock()
-        output_dict = {}
-        processed_count = 0
-        start_time = time.time()
-        logger.info("TIMOUT TIMER STARTED")
-        TIMEOUT = 7000  # seconds
-        
-        if not args.single_process:
-            workers = max(4, os.cpu_count())
-            logger.info(f"Running in multiprocessing mode using {workers} worker processes.")
-            with multiprocessing.Pool(workers) as pool:
-                func = partial(process_file, dh=dh, model=model, seq_len=seq_len,
-                               selected_feature_columns=SELECTED_FEATURE_COLUMNS,
-                               epsilon=EPSILON, scaling_params=scaling_params,
-                               propagation_params=PROPAGATION_PARAMS,
-                               output_path=output_path, file_lock=file_lock)
-                for res in pool.imap_unordered(func, file_ids):
-                    output_dict.update(res)
-                    processed_count += 1
-                    logger.info(f"Processed {processed_count}/{total_files} files.")
-                    if time.time() - start_time > TIMEOUT:
-                        logger.info("Overall runtime exceeded TIMEOUT. Terminating further processing.")
-                        break
-        else:
-            logger.info("Running in sequential mode.")
-            for file_id in file_ids:
-                res = process_file(file_id, dh, model, seq_len, SELECTED_FEATURE_COLUMNS,
-                                     EPSILON, scaling_params, PROPAGATION_PARAMS, output_path, file_lock)
+    output_dict = {}
+    processed_count = 0
+    start_time = time.time()
+    logger.info("TIMEOUT TIMER STARTED")
+    TIMEOUT = 7000  # seconds
+    
+    if not args.single_process:
+        workers = max(4, os.cpu_count())
+        logger.info(f"Running in multiprocessing mode using {workers} worker processes.")
+        with multiprocessing.Pool(workers) as pool:
+            func = partial(process_file, dh=dh, model=model, seq_len=seq_len,
+                           selected_feature_columns=SELECTED_FEATURE_COLUMNS,
+                           epsilon=EPSILON, scaling_params=scaling_params,
+                           propagation_params=PROPAGATION_PARAMS)
+            for res in pool.imap_unordered(func, file_ids):
                 output_dict.update(res)
                 processed_count += 1
-                logger.info(f"Processed {processed_count}/{total_files} files sequentially.")
+                logger.info(f"Processed {processed_count}/{total_files} files.")
                 if time.time() - start_time > TIMEOUT:
-                    logger.info(f"Overall runtime exceeded TIMEOUT ({TIMEOUT} [s]). Terminating further processing.")
+                    logger.info("Overall runtime exceeded TIMEOUT. Terminating further processing.")
                     break
+    else:
+        logger.info("Running in sequential mode.")
+        for file_id in file_ids:
+            res = process_file(file_id, dh, model, seq_len, SELECTED_FEATURE_COLUMNS,
+                               EPSILON, scaling_params, PROPAGATION_PARAMS)
+            output_dict.update(res)
+            processed_count += 1
+            logger.info(f"Processed {processed_count}/{total_files} files sequentially.")
+            if time.time() - start_time > TIMEOUT:
+                logger.info(f"Overall runtime exceeded TIMEOUT ({TIMEOUT} [s]). Terminating further processing.")
+                break
 
-        # Final save (update JSON file) with current output_dict.
-        with file_lock:
-            with open(output_path, "w") as f:
-                json.dump(output_dict, f, indent=4)
-        logger.info(f"Prediction JSON saved to {output_path}")
+    # Write all results to the JSON file only once.
+    with open(output_path, "w") as f:
+        json.dump(output_dict, f, indent=4)
+    logger.info(f"Prediction JSON saved to {output_path}")
 
 if __name__ == "__main__":
     main()

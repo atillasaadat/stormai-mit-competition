@@ -55,27 +55,8 @@ def load_and_preprocess_data(dh, file_usage_percent, target_col, selected_featur
     msis_density = data["MSIS Density (kg/m^3)"].values.reshape(-1, 1)
     y_ratio = data[target_col].values.reshape(-1, 1) / msis_density
 
-    # Standardize input features.
-    X_mean = np.mean(X_raw, axis=0)
-    X_std = np.std(X_raw, axis=0)
-    X_scaled = (X_raw - X_mean) / (X_std + epsilon)
-    
-    if np.isnan(X_scaled).any() or np.isnan(y_ratio).any():
-        logging.error("NaN values found in processed data!")
-        raise ValueError("Processing produced NaN values.")
-    
-    # Save input scaling parameters (for features only)
-    scaling_params = {
-        "X_mean": X_mean.tolist(),
-        "X_std": X_std.tolist()
-    }
-    scaling_path = Path("scaling_params.json")
-    with open(scaling_path, "w") as f:
-        json.dump(scaling_params, f, indent=4)
-    logging.info(f"Scaling parameters saved to {scaling_path}")
-    
     file_ids = data["file_id"].values
-    return X_scaled, y_ratio, file_ids, data_raw
+    return X_raw, y_ratio, file_ids, data_raw
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, X, y, seq_len, file_ids=None):
@@ -96,14 +77,23 @@ class TimeSeriesDataset(Dataset):
         else:
             return torch.FloatTensor(x_seq), torch.FloatTensor(y_val)
 
-def get_datasets(X_scaled, y_ratio, file_ids, seq_len, split_ratio):
-    split_index = int(len(X_scaled) * split_ratio)
-    X_train, y_train = X_scaled[:split_index], y_ratio[:split_index]
-    X_test, y_test = X_scaled[split_index:], y_ratio[split_index:]
+def get_datasets(X_raw, y_ratio, file_ids, seq_len, split_ratio, epsilon):
+    # First split into train and test; then compute normalization parameters on train set only.
+    split_index = int(len(X_raw) * split_ratio)
+    X_train_raw, y_train = X_raw[:split_index], y_ratio[:split_index]
+    X_test_raw, y_test = X_raw[split_index:], y_ratio[split_index:]
     file_ids_train, file_ids_test = file_ids[:split_index], file_ids[split_index:]
+    
+    # Compute normalization parameters on training data only.
+    X_mean = np.mean(X_train_raw, axis=0)
+    X_std = np.std(X_train_raw, axis=0)
+    # Apply same transformation to both training and test data.
+    X_train = (X_train_raw - X_mean) / (X_std + epsilon)
+    X_test = (X_test_raw - X_mean) / (X_std + epsilon)
+    
     train_dataset = TimeSeriesDataset(X_train, y_train, seq_len)
     test_dataset = TimeSeriesDataset(X_test, y_test, seq_len, file_ids=file_ids_test)
-    return train_dataset, test_dataset, file_ids_train, file_ids_test
+    return train_dataset, test_dataset, file_ids_train, file_ids_test, X_mean, X_std
 
 class PatchTST(nn.Module):
     def __init__(self, seq_len, patch_size, num_features, d_model, nhead, num_layers, dropout=0.1):
@@ -118,9 +108,11 @@ class PatchTST(nn.Module):
 
     def forward(self, x):
         B, L, C = x.shape
+        # Reshape into patches
         x = x.reshape(B, self.num_patches, self.patch_size * C)
         x = self.proj(x)
         x = self.transformer_encoder(x)
+        # Use the representation from the last patch.
         x = x[:, -1, :]
         out = self.fc(x)
         return out
@@ -166,19 +158,15 @@ def evaluate_model_fn(model, dataloader, criterion, device):
     rmse_overall = np.sqrt(mse_overall)
     return rmse_avg, rmse_overall
 
-def plot_file_predictions(file_id, data_raw, model, seq_len, selected_feature_columns, target_col, device):
+def plot_file_predictions(file_id, data_raw, model, seq_len, selected_feature_columns, target_col, device, X_mean, X_std, epsilon):
     file_data = data_raw[data_raw["file_id"] == file_id].copy()
     file_data.sort_values("Timestamp", inplace=True)
     if "log_Altitude" not in file_data.columns:
         file_data["log_Altitude"] = np.log10(file_data["Altitude (km)"])
     
     raw_arrays = file_data[selected_feature_columns].values
-    # For plotting, we use the saved scaling parameters (assume they exist)
-    with open("scaling_params.json", "r") as f:
-        scaling_params = json.load(f)
-    X_mean = np.array(scaling_params["X_mean"])
-    X_std = np.array(scaling_params["X_std"])
-    X_scaled = (raw_arrays - X_mean) / (X_std + 1e-8)
+    # Apply normalization using training-set mean and std.
+    X_scaled = (raw_arrays - X_mean) / (X_std + epsilon)
     
     predictions = []
     timestamps = []
@@ -196,7 +184,6 @@ def plot_file_predictions(file_id, data_raw, model, seq_len, selected_feature_co
     ground_truth = file_data[target_col].values[seq_len:]
     msis_values = file_data["MSIS Density (kg/m^3)"].values[seq_len:]
     
-    import matplotlib.pyplot as plt
     fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(12, 8), sharex=True)
     ax1.plot(timestamps, ground_truth, label="Ground Truth", marker="o", linestyle="-")
     ax1.plot(timestamps, predictions, label="Predicted Corrected Density", marker="x", linestyle="--")
@@ -214,12 +201,12 @@ def plot_file_predictions(file_id, data_raw, model, seq_len, selected_feature_co
     plt.tight_layout()
     plt.show()
 
-def plot_random_file_id(file_ids_test, data_raw, model, seq_len, selected_feature_columns, target_col, device):
+def plot_random_file_id(file_ids_test, data_raw, model, seq_len, selected_feature_columns, target_col, device, X_mean, X_std, epsilon):
     unique_test_file_ids = np.unique(file_ids_test)
     logging.info("Test set file IDs: " + ", ".join(map(str, unique_test_file_ids)))
     random_file_id = np.random.choice(unique_test_file_ids)
     logging.info(f"Plotting predictions for File ID: {random_file_id}")
-    plot_file_predictions(random_file_id, data_raw, model, seq_len, selected_feature_columns, target_col, device)
+    plot_file_predictions(random_file_id, data_raw, model, seq_len, selected_feature_columns, target_col, device, X_mean, X_std, epsilon)
 
 # ---------------------------
 # Main Training Pipeline
@@ -239,7 +226,7 @@ if __name__ == "__main__":
     FILE_USAGE_PERCENT = 0.8
     TARGET_COL = "Orbit Mean Density (kg/m^3)"
     SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]
-    SEQ_LEN = 10
+    SEQ_LEN = 50
     SPLIT_RATIO = 0.8
     EPSILON = 1e-8
 
@@ -249,15 +236,16 @@ if __name__ == "__main__":
         dh, FILE_USAGE_PERCENT, TARGET_COL, SELECTED_FEATURE_COLUMNS, EPSILON
     )
 
-    from torch.utils.data import DataLoader
-    train_dataset, test_dataset, file_ids_train, file_ids_test = get_datasets(X_raw, y_ratio, file_ids, SEQ_LEN, SPLIT_RATIO)
+    train_dataset, test_dataset, file_ids_train, file_ids_test, X_mean, X_std = get_datasets(
+        X_raw, y_ratio, file_ids, SEQ_LEN, SPLIT_RATIO, EPSILON
+    )
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     num_features = X_raw.shape[1]
-    patch_size = 2
+    patch_size = 5
     d_model = 128
     nhead = 4
     num_layers = 3
@@ -266,22 +254,27 @@ if __name__ == "__main__":
                      d_model=d_model, nhead=nhead, num_layers=num_layers)
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.MSELoss()
+    # Use AdamW with weight decay and switch to Huber loss for robustness.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    criterion = nn.SmoothL1Loss()
 
-    num_epochs = 15
+    # Learning rate scheduler that reduces LR when validation loss plateaus.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+
+    num_epochs = 10
     for epoch in range(num_epochs):
-        train_model_fn(model, train_loader, optimizer, criterion, device, epoch)
+        train_loss = train_model_fn(model, train_loader, optimizer, criterion, device, epoch)
         rmse_avg, rmse_overall = evaluate_model_fn(model, test_loader, criterion, device)
-        logger.info(f"Epoch {epoch+1} - Test RMSE (batch avg): {rmse_avg:.6f}, Test RMSE (overall): {rmse_overall:.6f}")
+        logging.info(f"Epoch {epoch+1} - Test RMSE (batch avg): {rmse_avg:.6f}, Test RMSE (overall): {rmse_overall:.6f}")
+        scheduler.step(train_loss)
 
     rmse_avg, rmse_overall = evaluate_model_fn(model, test_loader, criterion, device)
-    logger.info(f"Final Test RMSE (batch avg): {rmse_avg:.6f}")
-    logger.info(f"Final Test RMSE (overall): {rmse_overall:.6f}")
+    logging.info(f"Final Test RMSE (batch avg): {rmse_avg:.6f}")
+    logging.info(f"Final Test RMSE (overall): {rmse_overall:.6f}")
 
     model_save_path = Path("density_prediction_patchtst_model.pth")
     torch.save(model.state_dict(), model_save_path)
-    logger.info(f"Model saved to {model_save_path}")
+    logging.info(f"Model saved to {model_save_path}")
 
-    plot_random_file_id(file_ids_test, data_raw, model, SEQ_LEN, SELECTED_FEATURE_COLUMNS, TARGET_COL, device)
+    plot_random_file_id(file_ids_test, data_raw, model, SEQ_LEN, SELECTED_FEATURE_COLUMNS, TARGET_COL, device, X_mean, X_std, EPSILON)
     from IPython import embed; embed(); quit()
