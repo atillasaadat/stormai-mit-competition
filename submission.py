@@ -4,8 +4,11 @@ Combined simulation propagation and model prediction pipeline.
 This version includes optimizations:
   1. Vectorized model prediction using batch processing.
   2. Reduced redundant MSIS calls in propagation (one call per integration step).
-  3. Batched file update: Each process returns its results, which are merged in memory,
-     and then the output JSON is written only once at the end.
+  3. Batched file update: Each process returns its results in memory,
+     and the output JSON is written only once at the end.
+     
+This submission script now uses the target_factor method.
+It loads scaling parameters (including y_mean, y_std, and target_factor) from a JSON file.
 """
 
 import os
@@ -35,7 +38,6 @@ from datahandler import DataHandler
 # ---------------------------
 # J2/pyMSIS Propagation Functions
 # ---------------------------
-
 MU = 3.986004418e14       # [m^3/s^2]
 R_E = 6378137.0           # [m]
 ecef_to_geo = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
@@ -180,7 +182,7 @@ def eci_to_lla(r_eci, current_time):
     return lat, lon, alt_m/1000.0
 
 # ---------------------------
-# Model Definition
+# Model Definition (matches trainer.py)
 # ---------------------------
 class PatchTST(nn.Module):
     def __init__(self, seq_len, patch_size, num_features, d_model, nhead, num_layers, dropout=0.1):
@@ -200,12 +202,20 @@ class PatchTST(nn.Module):
         x = self.transformer_encoder(x)
         x = x[:, -1, :]
         out = self.fc(x)
-        return torch.relu(out)
+        return out
 
 # ---------------------------
-# Prediction function with batched prediction
+# Updated Prediction Function with Target Inversion
 # ---------------------------
-def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon=1e-8, scaling_params=None):
+def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon=1e-8,
+                           scaling_params=None, y_mean=None, y_std=None, target_factor=1.0):
+    """
+    Predicts corrected density from a dataframe.
+    It uses the provided scaling parameters (or computes them if scaling_params is None)
+    and then inverts the target scaling: 
+         y_pred = (model_output * y_std + y_mean) / target_factor,
+    before multiplying by the MSIS density.
+    """
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df.sort_values("Timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -221,15 +231,16 @@ def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon
     X_scaled = (X_input - X_mean) / (X_std + epsilon)
     
     num_windows = len(X_scaled) - seq_len
-    # Build a 3D array of shape (num_windows, seq_len, features)
     windows = np.array([X_scaled[i:i+seq_len] for i in range(num_windows)])
     
     device = next(model.parameters()).device
     window_tensor = torch.FloatTensor(windows).to(device)
     model.eval()
     with torch.no_grad():
-        pred_ratios = model(window_tensor).cpu().numpy().flatten()
+        pred_scaled = model(window_tensor).cpu().numpy().flatten()
     
+    # Inverse the target scaling
+    pred_ratios = (pred_scaled * y_std[0] + y_mean[0]) / target_factor
     msis_vals = df.iloc[seq_len:]["MSIS Density (kg/m^3)"].values
     pred_densities = pred_ratios * msis_vals
     pred_timestamps = df.iloc[seq_len:]["Timestamp"].apply(
@@ -242,7 +253,7 @@ def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon
 # Per-file processing function
 # ---------------------------
 def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
-                 scaling_params, propagation_params):
+                 scaling_params, propagation_params, y_mean, y_std, target_factor):
     try:
         logger = logging.getLogger(__name__)
         file_id_str = f"{file_id:05d}"
@@ -300,14 +311,15 @@ def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
         
         logger.debug(f"File {file_id_str}: Running model prediction over propagated data...")
         pred_timestamps, predicted_densities = predict_from_dataframe(
-            propagated_df, model, seq_len, selected_feature_columns, epsilon, scaling_params
+            propagated_df, model, seq_len, selected_feature_columns, epsilon,
+            scaling_params, y_mean, y_std, target_factor
         )
 
         result_dict = {str(file_id): {"Timestamp": pred_timestamps,
                                       "Orbit Mean Density (kg/m^3)": predicted_densities}}
         process_file_end_time = time.time()
         logger.info(f"File {file_id_str}: Result saved. Time: {process_file_end_time - process_file_start_time:.3f} [s]")
-        plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine)
+        #plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine)
         return result_dict
     except Exception as e:
         logger.error(f"Error processing file ID {file_id:05d}: {e}")
@@ -355,23 +367,30 @@ def main():
     DATA_PATHS = {
         "omni2_folder": Path("/app/data/dataset/test/omni2"),
         "initial_state_file": Path("/app/input_data/initial_states.csv"),
-        #"sat_density_folder": None,
-        "sat_density_folder": Path("/app/sat_density"),
+        "sat_density_folder": None,
         "forcasted_omni2_folder": Path("/app/data/dataset/test/forcasted_omni2"),
         "sat_density_omni_forcasted_folder": Path("/app/data/dataset/test/sat_density_omni_forcasted"),
         "sat_density_omni_propagated_folder": Path("/app/data/dataset/test/sat_density_omni_propagated"),
     }
     
-    seq_len = 60
+    seq_len = 10
     SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]
     EPSILON = 1e-8
+    # Load scaling parameters saved during training.
     scaling_file = Path("scaling_params.json")
     if scaling_file.exists():
         with open(scaling_file, "r") as f:
             scaling_params = json.load(f)
+        # Expect the JSON to have keys "X_mean", "X_std", "y_mean", "y_std", "target_factor"
+        y_mean = np.array(scaling_params["y_mean"])
+        y_std = np.array(scaling_params["y_std"])
+        target_factor = scaling_params["target_factor"]
     else:
         scaling_params = None
-    
+        y_mean = np.array([0.0])
+        y_std = np.array([1.0])
+        target_factor = 1e-12
+
     dt_integ = 30.0
     total_seconds = 3 * 86400   # 3 days propagation
     steps_integ = int(total_seconds / dt_integ)
@@ -387,7 +406,7 @@ def main():
     
     MODEL_PATH = Path("density_prediction_patchtst_model.pth")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PatchTST(seq_len=seq_len, patch_size=5, num_features=len(SELECTED_FEATURE_COLUMNS),
+    model = PatchTST(seq_len=seq_len, patch_size=2, num_features=len(SELECTED_FEATURE_COLUMNS),
                       d_model=128, nhead=4, num_layers=3)
     model.to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
@@ -415,7 +434,8 @@ def main():
             func = partial(process_file, dh=dh, model=model, seq_len=seq_len,
                            selected_feature_columns=SELECTED_FEATURE_COLUMNS,
                            epsilon=EPSILON, scaling_params=scaling_params,
-                           propagation_params=PROPAGATION_PARAMS)
+                           propagation_params=PROPAGATION_PARAMS,
+                           y_mean=y_mean, y_std=y_std, target_factor=target_factor)
             for res in pool.imap_unordered(func, file_ids):
                 output_dict.update(res)
                 processed_count += 1
@@ -427,7 +447,8 @@ def main():
         logger.info("Running in sequential mode.")
         for file_id in file_ids:
             res = process_file(file_id, dh, model, seq_len, SELECTED_FEATURE_COLUMNS,
-                               EPSILON, scaling_params, PROPAGATION_PARAMS)
+                               EPSILON, scaling_params, PROPAGATION_PARAMS,
+                               y_mean, y_std, target_factor)
             output_dict.update(res)
             processed_count += 1
             logger.info(f"Processed {processed_count}/{total_files} files sequentially.")
