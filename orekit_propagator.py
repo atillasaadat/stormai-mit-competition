@@ -57,7 +57,7 @@ class OrbitPropagator:
     for drag force calculations.
     """
 
-    def __init__(self, initial_orbit, custom_atmosphere, sat_config, sim_config):
+    def __init__(self, initial_orbit, custom_atmosphere, sat_config, sim_config, predict_to_space_weather):
         """
         Initialize the orbit propagator.
 
@@ -69,6 +69,7 @@ class OrbitPropagator:
         self.sat_config = sat_config
         self.sim_config = sim_config
         self.atmosphere = custom_atmosphere
+        self.predict_to_space_weather = predict_to_space_weather
 
     def propagate(self, data):
         """
@@ -88,22 +89,22 @@ class OrbitPropagator:
         tspan = [
             datetime_to_absolutedate(ts.to_pydatetime()) for ts in timestamp_series
         ]
+        if self.predict_to_space_weather:
+            tspan = tspan[::-1]
 
         # Get central bodies
-        sun = CelestialBodyFactory.getSun()
-        moon = CelestialBodyFactory.getMoon()
+        #sun = CelestialBodyFactory.getSun()
+        #moon = CelestialBodyFactory.getMoon()
         # Earth for gravity and SRP
         itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
         r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS
         earth = OneAxisEllipsoid(r_Earth, Constants.IERS2010_EARTH_FLATTENING, itrf)
         # mu = Constants.IERS2010_EARTH_MU
-
         # Initial spacecraft state
         initial_date = self.initial_orbit.getDate()
         initial_state = SpacecraftState(self.initial_orbit, self.sat_config["satellite_mass_kg"])
         orbit_type = self.initial_orbit.getType()
         tol = NumericalPropagator.tolerances(self.sim_config["pos_tol"], self.initial_orbit, orbit_type)
-
         # Set up numerical integrator and propagator
         integrator = DormandPrince853Integrator(
             self.sim_config["min_step"], self.sim_config["max_step"], JArray_double.cast_(tol[0]), JArray_double.cast_(tol[1])
@@ -119,7 +120,6 @@ class OrbitPropagator:
         # srp_model = IsotropicRadiationSingleCoefficient(self.sat_config["srp_area_m2"], self.sat_config["cr"])
         # srp_provider = SolarRadiationPressure(sun, earth, srp_model)
         # propagator.addForceModel(srp_provider)
-
         # 2. Gravity Force using Holmes-Featherstone model
         gravity_provider = GravityFieldFactory.getConstantNormalizedProvider(self.sim_config['spherical_harmonics'][0], 
                                                                              self.sim_config['spherical_harmonics'][1], 
@@ -166,9 +166,9 @@ class OrbitPropagator:
             )
             states[idx] = state
             densities[idx] = float(density)
+            logger.debug(f"Finished propagation for step {idx + 1}/{n_steps}: {current_date.toString(0)}, Density={density:.6e} kg/m^3")
         toc = time.time()
         logger.debug(f"Propagation completed in {toc - tic:.3f} seconds.")
-
 
         # (Optional: trajectory plotting code could be added here)
         return tspan, states, densities
@@ -182,17 +182,19 @@ class PersistenceMSIS:
     to drive the MSIS atmospheric model.
     """
 
-    def __init__(self, logger, all_space_weather_data):
+    def __init__(self, logger, all_space_weather_data, predict_to_space_weather=False):
         """
         Initialize the persistence model by combining historical and forecasted data.
         """
         self.logger = logger
         self.all_space_weather_data = all_space_weather_data
+        self.predict_to_space_weather = predict_to_space_weather
 
     def run(self, dt, lon, lat, alt):
         index = (self.all_space_weather_data["Timestamp"] - dt).abs().idxmin()
         f107_daily = float(self.all_space_weather_data.iloc[index - 1]["f10.7_index"])
         ap_current = float(self.all_space_weather_data.iloc[index - 1]["ap_index_nT"])
+        self.logger.debug(f"Selecting index {index} for date {dt} with f10.7={f107_daily}, Ap={ap_current}")
 
         # Prepare Ap indices array
         aps = self.prepare_ap_indices(ap_current, index)
@@ -210,7 +212,7 @@ class PersistenceMSIS:
             )
         except Exception as e:
             logger.error(f"Error running MSIS: {e}")
-            raise
+            raise Exception(f"MSIS run failed for date {dt}, lon={lon}, lat={lat}, alt={alt}: {e}") from e
 
         density = result[0, 0]
         self.logger.debug(
@@ -261,10 +263,11 @@ class MSISPersistenceAtmosphere(PythonAtmosphere):
     Custom atmospheric model that uses PersistenceMSIS to compute density.
     """
 
-    def __init__(self, logger, omni_data):
+    def __init__(self, logger, omni_data, predict_to_space_weather=False):
         super().__init__()
         self.logger = logger
-        self.atm = PersistenceMSIS(logger, omni_data)
+        self.atm = PersistenceMSIS(logger, omni_data, predict_to_space_weather)
+        self.predict_to_space_weather = predict_to_space_weather
 
         r_Earth = Constants.IERS2010_EARTH_EQUATORIAL_RADIUS  # m
         self.itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
@@ -331,7 +334,7 @@ class SimulationRunner:
         self.sat_config = sat_config
         self.sim_config = sim_config
 
-    def run_simulation(self, file_id, initial_state, space_weather_data, sat_density_truth):
+    def run_simulation(self, file_id, initial_state, space_weather_data, sat_density_truth, predict_to_space_weather=False):
         """
         Runs the simulation:
             1. Loads required data.
@@ -347,7 +350,7 @@ class SimulationRunner:
         logger.info(f"Starting simulation for File ID {file_id:05d}.")
 
         # Build the custom atmosphere model
-        atmosphere = MSISPersistenceAtmosphere(self.logger, space_weather_data)
+        atmosphere = MSISPersistenceAtmosphere(self.logger, space_weather_data, predict_to_space_weather)
 
         # Build the initial orbit using the initial state values
         a0 = float(initial_state["Semi-major Axis (km)"]) * 1e3  # meters
@@ -384,19 +387,22 @@ class SimulationRunner:
         )
 
         # Create the propagator
-        propagator = OrbitPropagator(initial_orbit, atmosphere, self.sat_config, self.sim_config)
+        propagator = OrbitPropagator(initial_orbit, atmosphere, self.sat_config, self.sim_config, predict_to_space_weather)
 
-        # If sat_density_truth is None, generate propagation timestamps from initial_date to +3 days at 10-minute intervals.
-        if sat_density_truth is None:
-            start = pd.to_datetime(initial_state["Timestamp"])
-            if start.tzinfo is None:
-                start = start.tz_localize("UTC")
-            end = start + pd.Timedelta(days=3)
-            timestamps_range = pd.date_range(start=start, end=end, freq="10min", tz="UTC")
-            sat_density_truth = pd.DataFrame({"Timestamp": timestamps_range})
-        
-        # Propagate the orbit using the provided or generated timeline
-        timestamps, states, densities = propagator.propagate(sat_density_truth)
+        if predict_to_space_weather:
+            timestamps, states, densities = propagator.propagate(space_weather_data)
+        else:
+            # If sat_density_truth is None, generate propagation timestamps from initial_date to +3 days at 10-minute intervals.
+            if sat_density_truth is None:
+                start = pd.to_datetime(initial_state["Timestamp"])
+                if start.tzinfo is None:
+                    start = start.tz_localize("UTC")
+                end = start + pd.Timedelta(days=3)
+                timestamps_range = pd.date_range(start=start, end=end, freq="10min", tz="UTC")
+                sat_density_truth = pd.DataFrame({"Timestamp": timestamps_range})
+            
+            # Propagate the orbit using the provided or generated timeline
+            timestamps, states, densities = propagator.propagate(sat_density_truth)
 
         # Convert Orekit AbsoluteDate timestamps to pandas datetime
         timestamps_pd = []
@@ -409,7 +415,10 @@ class SimulationRunner:
             timestamps_pd.append(ts_utc)
 
         # Update the DataFrame with computed densities and geolocation values
-        new_df = sat_density_truth.copy()
+        if predict_to_space_weather:
+            new_df = space_weather_data.copy()
+        else:
+            new_df = sat_density_truth.copy()
         new_df["MSIS Density (kg/m^3)"] = np.nan
         new_df["Latitude (deg)"] = np.nan
         new_df["Longitude (deg)"] = np.nan
@@ -594,11 +603,11 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     # Define OVERWRITE flag and configuration inside __main__
-    OVERWRITE = False  # Set to False to skip processing if output file exists
+    OVERWRITE = True  # Set to False to skip processing if output file exists
 
     # Satellite and force model parameters
     sat_config = {
-        "satellite_mass_kg": 100.0,  # kg
+        "satellite_mass_kg": 400.0,  # kg
         "cross_section_m2": 1.0,     # m^2
         "srp_area_m2": 1.0,          # m^2
         "drag_coeff": 2.2,
@@ -607,11 +616,11 @@ if __name__ == "__main__":
 
     # Integrator tolerances and step sizes
     sim_config = {
-        "min_step": 1e-3,
-        "max_step": 100.0,
+        "min_step": 1e-6,
+        "max_step": 1000.0,
         "init_step": 10.0,
-        "pos_tol": 1e-2,
-        "spherical_harmonics": (4, 4),
+        "pos_tol": 1e-3,
+        "spherical_harmonics": (2, 2),
     }
 
     # Paths for data handling
