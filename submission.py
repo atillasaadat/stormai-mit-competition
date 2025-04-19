@@ -1,465 +1,349 @@
-"""
-Combined simulation propagation and model prediction pipeline.
-
-This version includes optimizations:
-  1. Vectorized model prediction using batch processing.
-  2. Reduced redundant MSIS calls in propagation (one call per integration step).
-  3. Batched file update: Each process returns its results in memory,
-     and the output JSON is written only once at the end.
-     
-This submission script now uses the target_factor method.
-It loads scaling parameters (including y_mean, y_std, and target_factor) from a JSON file.
+#!/usr/bin/env python3
+"""storm_density_model.py – v2.4
+================================
+– multi‑resolution OMNI (1 h & 3 h) with 1/2/3 h lags
+– NRLMSISE‑00 baseline so the net learns residuals
+– cyclical static features (lon / day‑of‑year / seconds‑in‑day)
+– OD‑RMSE skill score in training loop (perfect = 1, baseline = 0)
 """
 
-import os
-import math
-import json
-import logging
+from __future__ import annotations
+
+import argparse, json, logging, math, random, time
+from math import exp, log
 from pathlib import Path
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import multiprocessing
-import argparse
-from functools import partial
-from datetime import datetime, timedelta
-import time
-import matplotlib
-matplotlib.use('Agg')
+from typing import Dict, List
+
+import numpy as np, pandas as pd, torch
+from filelock import FileLock
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-# Import propagation functions and dependencies.
-from pymsis import msis
-from pyproj import Transformer
-from numba import njit
-from datahandler import DataHandler
+from datahandler import DataHandler     # ← helper supplied by competition baseline
 
-# ---------------------------
-# J2/pyMSIS Propagation Functions
-# ---------------------------
-MU = 3.986004418e14       # [m^3/s^2]
-R_E = 6378137.0           # [m]
-ecef_to_geo = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
+# ───────────────────────────────── constants ────────────────────────────────
+NUM_HIST_HOURS = 24 * 60            # 1 440 (60 days hourly history)
+FORECAST_STEPS = 3 * 24 * 6         # 432 (3 days @ 10‑min)
+LOG_EPS        = 1e-14
 
-def oe2rv(a_km, e, i_deg, raan_deg, argp_deg, nu_deg):
-    i = math.radians(i_deg)
-    raan = math.radians(raan_deg)
-    argp = math.radians(argp_deg)
-    nu = math.radians(nu_deg)
-    a = a_km * 1e3
-    p = a * (1 - e**2)
-    r_val = p / (1 + e * math.cos(nu))
-    r_pf = np.array([r_val * math.cos(nu), r_val * math.sin(nu), 0.0])
-    v_pf = np.array([
-        -math.sqrt(MU / p) * math.sin(nu),
-         math.sqrt(MU / p) * (e + math.cos(nu)),
-         0.0
-    ])
-    R = np.array([
-        [math.cos(raan)*math.cos(argp) - math.sin(raan)*math.sin(argp)*math.cos(i),
-         -math.cos(raan)*math.sin(argp) - math.sin(raan)*math.cos(argp)*math.cos(i),
-         math.sin(raan)*math.sin(i)],
-        [math.sin(raan)*math.cos(argp) + math.cos(raan)*math.sin(argp)*math.cos(i),
-         -math.sin(raan)*math.sin(argp) + math.cos(raan)*math.cos(argp)*math.cos(i),
-         -math.cos(raan)*math.sin(i)],
-        [math.sin(argp)*math.sin(i),
-         math.cos(argp)*math.sin(i),
-         math.cos(i)]
-    ])
-    r_eci = R @ r_pf
-    v_eci = R @ v_pf
-    return r_eci, v_eci
+# base OMNI columns (add more if desired)
+BASE = [
+    "f10.7_index", "Lyman_alpha", "ap_index_nT", "Kp_index", "Dst_index_nT",
+    "AE_index_nT", "SW_Plasma_Speed_km_s", "SW_Proton_Density_N_cm3",
+    "Flow_pressure", "BX_nT_GSE_GSM", "BZ_nT_GSM"
+]
+RESOLUTIONS_H = [1, 3]              # 1‑h & 3‑h means
+LAG_MINUTES   = [60, 120, 180]      # 1 h / 2 h / 3 h lags
 
-def gmst(dt):
-    JD = (dt - datetime(2000, 1, 1, 12)).total_seconds()/86400.0 + 2451545.0
-    GMST_hours = 18.697374558 + 24.06570982441908 * (JD - 2451545.0)
-    GMST_hours %= 24.0
-    return (GMST_hours / 24.0) * 2 * math.pi
+# expand to full feature list
+HIST_FEATURES = []
+for res in RESOLUTIONS_H:
+    suf = "" if res == 1 else f"_{res}h"
+    HIST_FEATURES += [f"{c}{suf}" for c in BASE]
+    for lag in LAG_MINUTES:
+        HIST_FEATURES += [f"{c}{suf}_lag{lag}" for c in BASE]
 
-def eci_to_ecef(r_eci, current_time):
-    theta = gmst(current_time)
-    cos_theta = math.cos(-theta)
-    sin_theta = math.sin(-theta)
-    R = np.array([[cos_theta, -sin_theta, 0],
-                  [sin_theta,  cos_theta, 0],
-                  [0,          0,         1]])
-    return R @ r_eci
+STATIC_RAW     = ["Semi-major Axis (km)", "Eccentricity", "Inclination (deg)",
+                  "Altitude (km)", "Latitude (deg)", "Longitude (deg)"]
+TOTAL_FEATURES = len(HIST_FEATURES) + len(STATIC_RAW) + 6 + 1   # +6 cyclical, +1 MSIS
+# ───────────────────────────────── helpers ──────────────────────────────────
 
-def get_density(current_time, r_eci, f107_daily, aps):
-    r_ecef = eci_to_ecef(r_eci, current_time)
-    x, y, z = r_ecef
-    lon, lat, alt_m = ecef_to_geo.transform(x, y, z)
-    alt_km = alt_m / 1000.0
-    try:
-        result = msis.run(
-            dates=[current_time],
-            lons=[lon],
-            lats=[lat],
-            alts=[alt_km],
-            f107s=[f107_daily],
-            aps=[aps]
-        )
-        density = result[0, 0]
-    except Exception as e:
-        raise Exception(f"Error running MSIS at alt {alt_km:.2f} km: {e}")
-    return density
+def _pad_or_trim(a: np.ndarray, length: int, axis: int = 0):
+    if a.shape[axis] == length: return a
+    if a.shape[axis] > length:
+        sl = [slice(None)]*a.ndim; sl[axis] = slice(-length, None)
+        return a[tuple(sl)]
+    pad_len = length - a.shape[axis]
+    rep = np.take(a, [-1], axis=axis)
+    pad = np.repeat(rep, pad_len, axis=axis)
+    return np.concatenate([a, pad], axis=axis)
 
-@njit
-def gravitational_acceleration(r):
-    x, y, z = r[0], r[1], r[2]
-    r_norm = math.sqrt(x*x + y*y + z*z)
-    r_norm3 = r_norm**3
-    acc = np.array([-MU*x / r_norm3,
-                    -MU*y / r_norm3,
-                    -MU*z / r_norm3])
-    J2 = 1.08263e-3
-    factor = 1.5 * J2 * MU * (R_E**2) / (r_norm**5)
-    acc[0] += factor * x * (5*(z**2)/(r_norm**2) - 1)
-    acc[1] += factor * y * (5*(z**2)/(r_norm**2) - 1)
-    acc[2] += factor * z * (5*(z**2)/(r_norm**2) - 3)
-    return acc
+def _build_resolution(df: pd.DataFrame, hrs: int):
+    if hrs == 1: return df
+    coarse = df.resample(f"{hrs}h").mean().ffill()
+    return coarse.reindex(df.index, method="ffill")
 
-@njit
-def drag_from_density(density, v, mass, Cd, A):
-    v_norm = math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
-    if v_norm < 1e-8:
-        return np.zeros(3)
-    return -0.5 * Cd * A * density * v_norm * v / mass
+def clean_omni2(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.replace({99999.99: np.nan, 9999999: np.nan, -1: np.nan}).copy()
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
+    df.set_index("Timestamp", inplace=True)
+    base = (df[BASE].resample("1h").mean()
+                    .interpolate(limit_direction="both").ffill().bfill())
 
-@njit
-def rk4_step(r, v, density, dt, mass, Cd, A):
-    k1_r = v
-    k1_v = gravitational_acceleration(r) + drag_from_density(density, v, mass, Cd, A)
-    
-    r_temp = r + 0.5 * dt * k1_r
-    v_temp = v + 0.5 * dt * k1_v
-    k2_r = v_temp
-    k2_v = gravitational_acceleration(r_temp) + drag_from_density(density, v_temp, mass, Cd, A)
-    
-    r_temp = r + 0.5 * dt * k2_r
-    v_temp = v + 0.5 * dt * k2_v
-    k3_r = v_temp
-    k3_v = gravitational_acceleration(r_temp) + drag_from_density(density, v_temp, mass, Cd, A)
-    
-    r_temp = r + dt * k3_r
-    v_temp = v + dt * k3_v
-    k4_r = v_temp
-    k4_v = gravitational_acceleration(r_temp) + drag_from_density(density, v_temp, mass, Cd, A)
-    
-    r_new = r + (dt/6.0) * (k1_r + 2*k2_r + 2*k3_r + k4_r)
-    v_new = v + (dt/6.0) * (k1_v + 2*k2_v + 2*k3_v + k4_v)
-    return r_new, v_new
+    frames = {}
+    for res in RESOLUTIONS_H:
+        suf = "" if res == 1 else f"_{res}h"
+        frames[res] = _build_resolution(base, res).add_suffix(suf)
 
-def propagate_orbit(r0, v0, t0, dt, steps, mass, Cd, A, f107_daily, aps, use_single_density=True):
-    """
-    Propagate the orbit using RK4 integration.
-    If use_single_density=True then get_density is only called once per time step.
-    """
-    times = [t0]
-    states = [np.hstack((r0, v0))]
-    densities = [get_density(t0, r0, f107_daily, aps)]
-    
-    r = r0.copy()
-    v = v0.copy()
-    current_time = t0
-    for i in range(steps):
-        density = get_density(current_time, r, f107_daily, aps)
-        r, v = rk4_step(r, v, density, dt, mass, Cd, A)
-        current_time = current_time + timedelta(seconds=dt)
-        times.append(current_time)
-        states.append(np.hstack((r, v)))
-        if use_single_density:
-            densities.append(density)
-        else:
-            densities.append(get_density(current_time, r, f107_daily, aps))
-    return times, np.array(states), densities
+    cols = [frames[r] for r in RESOLUTIONS_H]
+    for lag in LAG_MINUTES:
+        shift = base.shift(lag//60, freq=f"{lag}min")
+        for res in RESOLUTIONS_H:
+            suf = "" if res == 1 else f"_{res}h"
+            cols.append(_build_resolution(shift, res).add_suffix(f"{suf}_lag{lag}"))
+    full = pd.concat(cols, axis=1).fillna(0.0)
+    return full.reindex(columns=HIST_FEATURES)
 
-def eci_to_lla(r_eci, current_time):
-    r_ecef = eci_to_ecef(r_eci, current_time)
-    x, y, z = r_ecef
-    lon, lat, alt_m = ecef_to_geo.transform(x, y, z)
-    return lat, lon, alt_m/1000.0
+def static_vec(init: pd.Series) -> np.ndarray:
+    raw = init[STATIC_RAW].astype(float).to_numpy()
+    lon_rad = math.radians(float(init["Longitude (deg)"]))
+    lon_s, lon_c = math.sin(lon_rad), math.cos(lon_rad)
+    ts = pd.to_datetime(init["Timestamp"], utc=True)
+    doy_rad = 2*math.pi*ts.day_of_year/365.25
+    sid_rad = 2*math.pi*(ts.hour*3600+ts.minute*60+ts.second)/86400.0
+    return np.concatenate([raw,
+                           [lon_s, lon_c,
+                            math.sin(doy_rad), math.cos(doy_rad),
+                            math.sin(sid_rad), math.cos(sid_rad)]])
 
-# ---------------------------
-# Model Definition (matches trainer.py)
-# ---------------------------
-class PatchTST(nn.Module):
-    def __init__(self, seq_len, patch_size, num_features, d_model, nhead, num_layers, dropout=0.1):
-        super(PatchTST, self).__init__()
-        self.patch_size = patch_size
-        self.num_patches = seq_len // patch_size
-        self.proj = nn.Linear(patch_size * num_features, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
-                                                    dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(d_model, 1)
+# ─────────────────────────────── dataset ───────────────────────────────────
+class DensityDS(Dataset):
+    def __init__(self, fids: List[str], dh, sx=None, sy=None, fit=False):
+        self.fids, self.dh = fids, dh
+        self.sx = sx or QuantileTransformer(output_distribution="normal")
+        self.sy = sy or StandardScaler()
+        if fit: self._fit()
 
+    # —— scaler fit ——
+    def _fit(self):
+        X, Y = [], []
+        for fid in tqdm(self.fids, desc="scaler_fit"):
+            x, y = self._xy(fid)
+            X.append(x); Y.append(y)
+        self.sx.fit(np.vstack(X).reshape(-1, TOTAL_FEATURES))
+        self.sy.fit(np.hstack(Y).reshape(-1,1))
+
+    # —— MSIS baseline for a sample ——
+    def _msis_baseline(self, fid: str) -> float:
+        try:
+            df = self.dh.read_csv_data(fid, self.dh.sat_density_omni_propagated_folder)
+            return float(df["Orbit Mean Density (kg/m^3)"].iloc[0])
+        except Exception:
+            return 1e-12
+
+    # —— build (hist, target) ——
+    def _xy(self, fid: str):
+        omni = clean_omni2(self.dh.read_csv_data(fid, self.dh.omni2_folder))
+        hist = _pad_or_trim(omni.to_numpy(np.float32), NUM_HIST_HOURS)
+        stat = static_vec(self.dh.get_initial_state(fid)).astype(np.float32)
+        msis = self._msis_baseline(fid)
+        hist = np.hstack([hist,
+                          np.full((NUM_HIST_HOURS,1), msis, dtype=np.float32),
+                          np.repeat(stat[None,:], NUM_HIST_HOURS,0)])
+
+        dens = self.dh.read_csv_data(fid, self.dh.sat_density_folder)["Orbit Mean Density (kg/m^3)"].to_numpy(np.float32)
+        valid = dens < 1.0
+        dens = dens[valid] if valid.any() else np.full(FORECAST_STEPS, msis)
+        dens = _pad_or_trim(dens, FORECAST_STEPS)
+        y_log = np.log10(np.clip(dens/msis, LOG_EPS, None))   # residual ratio
+        return hist, y_log
+
+    def __len__(self): return len(self.fids)
+    def __getitem__(self, i):
+        x, y = self._xy(self.fids[i])
+        x = self.sx.transform(x.reshape(-1, TOTAL_FEATURES)).reshape(NUM_HIST_HOURS, TOTAL_FEATURES)
+        y = self.sy.transform(y.reshape(-1, 1)).ravel().astype(np.float32)   #  ← add astype
+        return torch.from_numpy(x).float(), torch.from_numpy(y).float()
+
+
+# ─────────────────────────────── model ─────────────────────────────────────
+class BiGRU(nn.Module):
+    def __init__(self, inp=TOTAL_FEATURES, hid=256, layers=3):
+        super().__init__()
+        self.gru = nn.GRU(inp, hid, layers, dropout=0.3,
+                          bidirectional=True, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(hid*2, hid), nn.ReLU(),
+                                  nn.Dropout(0.3), nn.Linear(hid, FORECAST_STEPS))
     def forward(self, x):
-        B, L, C = x.shape
-        x = x.reshape(B, self.num_patches, self.patch_size * C)
-        x = self.proj(x)
-        x = self.transformer_encoder(x)
-        x = x[:, -1, :]
-        out = self.fc(x)
-        return out
+        _, h = self.gru(x)
+        z = torch.cat([h[-2], h[-1]], 1)
+        return self.head(z)
 
-# ---------------------------
-# Updated Prediction Function with Target Inversion
-# ---------------------------
-def predict_from_dataframe(df, model, seq_len, selected_feature_columns, epsilon=1e-8,
-                           scaling_params=None, y_mean=None, y_std=None, target_factor=1.0):
-    """
-    Predicts corrected density from a dataframe.
-    It uses the provided scaling parameters (or computes them if scaling_params is None)
-    and then inverts the target scaling: 
-         y_pred = (model_output * y_std + y_mean) / target_factor,
-    before multiplying by the MSIS density.
-    """
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-    df.sort_values("Timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    if "log_Altitude" not in df.columns:
-        df["log_Altitude"] = np.log10(df["Altitude (km)"])
-    X_input = df[selected_feature_columns].values
-    if scaling_params is None:
-        X_mean = np.mean(X_input, axis=0)
-        X_std = np.std(X_input, axis=0)
-    else:
-        X_mean = np.array(scaling_params["X_mean"])
-        X_std = np.array(scaling_params["X_std"])
-    X_scaled = (X_input - X_mean) / (X_std + epsilon)
-    
-    num_windows = len(X_scaled) - seq_len
-    windows = np.array([X_scaled[i:i+seq_len] for i in range(num_windows)])
-    
-    device = next(model.parameters()).device
-    window_tensor = torch.FloatTensor(windows).to(device)
-    model.eval()
+# ──────────────────────────── metrics ──────────────────────────────────────
+def _rmse(model, loader, crit, opt=None, device="cpu"):
+    tot, n = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        pred = model(xb); loss = crit(pred, yb)
+        if opt is not None:
+            opt.zero_grad(); loss.backward(); opt.step()
+        tot += loss.item()*xb.size(0); n += xb.size(0)
+    return math.sqrt(tot/n)
+
+def _mae_phys(model, loader, ds, device="cpu"):
+    mae, n = 0.0, 0
+    for xb, yb in loader:
+        with torch.no_grad():
+            pred = model(xb.to(device)).cpu().numpy(); yb = yb.numpy()
+        p_log = ds.sy.inverse_transform(pred)
+        t_log = ds.sy.inverse_transform(yb)
+        mae += np.abs((10**p_log - LOG_EPS) - (10**t_log - LOG_EPS)).sum(); n += p_log.size
+    return mae/n
+
+def _od_rmse(model, loader, ds, device="cpu", eps=1e-5):
+    dur_sec = FORECAST_STEPS * 600.0
+    gamma   = -log(eps) / dur_sec
+    t_sec   = np.arange(FORECAST_STEPS) * 600.0
+    w       = np.exp(-gamma * t_sec)
+
+    num, den = 0.0, 0.0
+    for xb, yb in loader:
+        with torch.no_grad():
+            pred = model(xb.to(device)).cpu().numpy()
+        p_log = ds.sy.inverse_transform(pred)
+        t_log = ds.sy.inverse_transform(yb.numpy())
+        msis  = xb[:,0,-1].numpy().reshape(-1,1)
+
+        dens_p = msis * (10**p_log - LOG_EPS)
+        dens_t = msis * (10**t_log - LOG_EPS)
+        dens_m = msis
+
+        rmse_p = np.sqrt(((dens_p - dens_t)**2).mean(axis=0))
+        rmse_m = np.sqrt(((dens_m - dens_t)**2).mean(axis=0))
+
+        num += (w * (1 - rmse_p / rmse_m)).sum()
+        den += w.sum()
+    return num / den
+
+# ───────────────────────── training loop ───────────────────────────────────
+def train(ids: List[str], dh, ckpt: Path, epochs=120, patience=16, device="cpu"):
+    tr, va = train_test_split(ids, test_size=0.2, random_state=42)
+    ds_tr = DensityDS(tr, dh, fit=True)
+    ds_va = DensityDS(va, dh, sx=ds_tr.sx, sy=ds_tr.sy)
+    dl_tr = DataLoader(ds_tr, batch_size=64, shuffle=True)
+    dl_va = DataLoader(ds_va, batch_size=64)
+
+    net, crit = BiGRU().to(device), nn.MSELoss()
+    opt = torch.optim.AdamW(net.parameters(), lr=3e-4, weight_decay=1e-4)
+
+    best_skill, wait = -1.0, patience
+    for ep in range(1, epochs+1):
+        rmse_tr = _rmse(net, dl_tr, crit, opt, device)
+        rmse_va = _rmse(net, dl_va, crit, None, device)
+        od_va   = _od_rmse(net, dl_va, ds_va, device)
+        logging.info(f"ep{ep:02d}  RMSEtr={rmse_tr:.3f}  RMSEva={rmse_va:.3f}  OD‑RMSE={od_va:.4f}")
+        if od_va > best_skill + 1e-4:
+            best_skill, wait = od_va, patience
+            torch.save({"model":net.state_dict(), "sx":ds_tr.sx, "sy":ds_tr.sy}, ckpt)
+        else:
+            wait -= 1
+            if wait == 0:
+                logging.info("early‑stop"); break
+
+    net, _, _ = load_net(ckpt, device)
+    final_skill = _od_rmse(net, dl_va, ds_va, device)
+    logging.info(f"Validation OD‑RMSE skill = {final_skill:.4f}")
+
+# ─────────────────────────── inference ─────────────────────────────────────
+def load_net(ckpt: Path, device="cpu"):
+    chk = torch.load(ckpt, map_location=device, weights_only=False)
+    net = BiGRU(); net.load_state_dict(chk["model"]); net.to(device).eval()
+    return net, chk["sx"], chk["sy"]
+
+def predict_one(fid: str, dh, net, sx, sy, device="cpu") -> Dict[str,List]:
+    msis = DensityDS._msis_baseline(DensityDS, fid)
+    omni = clean_omni2(dh.read_csv_data(fid, dh.omni2_folder))
+    hist = _pad_or_trim(omni.to_numpy(np.float32), NUM_HIST_HOURS)
+    sv   = static_vec(dh.get_initial_state(fid)).astype(np.float32)
+    hist = np.hstack([hist,
+                      np.full((NUM_HIST_HOURS,1), msis, dtype=np.float32),
+                      np.repeat(sv[None,:], NUM_HIST_HOURS,0)])
+    x = sx.transform(hist.reshape(-1, TOTAL_FEATURES)).reshape(1, NUM_HIST_HOURS, TOTAL_FEATURES)
     with torch.no_grad():
-        pred_scaled = model(window_tensor).cpu().numpy().flatten()
-    
-    # Inverse the target scaling
-    pred_ratios = (pred_scaled * y_std[0] + y_mean[0]) / target_factor
-    msis_vals = df.iloc[seq_len:]["MSIS Density (kg/m^3)"].values
-    pred_densities = pred_ratios * msis_vals
-    pred_timestamps = df.iloc[seq_len:]["Timestamp"].apply(
-        lambda ts: ts.tz_localize("UTC") if ts.tzinfo is None else ts
-    ).apply(lambda ts: ts.isoformat()).tolist()
-    
-    return pred_timestamps, pred_densities.tolist()
+        pred_norm = net(torch.from_numpy(x).to(device)).cpu().numpy().ravel()
+    pred_log = sy.inverse_transform(pred_norm.reshape(-1,1)).ravel()
+    dens = msis * (10**pred_log - LOG_EPS)
 
-# ---------------------------
-# Per-file processing function
-# ---------------------------
-def process_file(file_id, dh, model, seq_len, selected_feature_columns, epsilon,
-                 scaling_params, propagation_params, y_mean, y_std, target_factor):
-    try:
-        logger = logging.getLogger(__name__)
-        file_id_str = f"{file_id:05d}"
-        process_file_start_time = time.time()
-        logger.info(f"Starting File {file_id_str}: Loading initial state...")
-        initial_state = dh.get_initial_state(file_id)
-        t0 = pd.to_datetime(initial_state["Timestamp"])
-        a_km = initial_state["Semi-major Axis (km)"]
-        e = initial_state["Eccentricity"]
-        i_deg = initial_state["Inclination (deg)"]
-        raan_deg = initial_state["RAAN (deg)"]
-        argp_deg = initial_state["Argument of Perigee (deg)"]
-        nu_deg = initial_state["True Anomaly (deg)"]
+    t0 = pd.to_datetime(dh.get_initial_state(fid)["Timestamp"], utc=True).round("10min")
+    ts = pd.date_range(t0, periods=FORECAST_STEPS, freq="10min", tz="UTC")
+    return {"Timestamp": [t.isoformat() for t in ts],
+            "Orbit Mean Density (kg/m^3)": dens.tolist()}
 
-        logger.debug(f"File {file_id_str}: Converting orbital elements to state vectors...")
-        r0, v0 = oe2rv(a_km, e, i_deg, raan_deg, argp_deg, nu_deg)
-        
-        logger.debug(f"File {file_id_str}: Reading OMNI2 data for MSIS inputs...")
-        omni_data = dh.read_csv_data(file_id, dh.omni2_folder)
-        latest_row = omni_data.loc[omni_data['Timestamp'].idxmax()]
-        last_ap = latest_row['ap_index_nT']
-        last_f107 = latest_row['f10.7_index']
-        aps = [last_ap] * 7
-        f107 = last_f107
+# ───────────────────────────── utility ─────────────────────────────────────
+def plot_file(fid, pred, dh):
+    truth = dh.read_csv_data(fid, dh.sat_density_folder).dropna()
+    truth.loc[truth["Orbit Mean Density (kg/m^3)"] > 1.0,
+              "Orbit Mean Density (kg/m^3)"] = 0
+    plt.figure(figsize=(10,4)); plt.yscale("log")
+    plt.plot(truth["Timestamp"], truth["Orbit Mean Density (kg/m^3)"], label="truth")
+    plt.plot(pd.to_datetime(pred["Timestamp"]), pred["Orbit Mean Density (kg/m^3)"], label="pred")
+    plt.legend(); plt.xlabel("Time"); plt.ylabel("ρ (kg/m³)")
+    plt.show()
+    png = f"compare_{fid}.png"; plt.tight_layout(); plt.savefig(png); plt.close()
+    logging.info(f"plot → {png}")
 
-        logger.debug(f"File {file_id_str}: Propagating orbit using J₂/pyMSIS propagation...")
-        dt_integ = propagation_params["dt_integ"]
-        steps_integ = propagation_params["steps_integ"]
-        mass = propagation_params["mass"]
-        Cd = propagation_params["Cd"]
-        A = propagation_params["A"]
-        times_fine, states_fine, densities_fine = propagate_orbit(
-            r0, v0, t0, dt_integ, steps_integ, mass, Cd, A, f107, aps, use_single_density=True
-        )
-        sample_rate = propagation_params["sample_rate"]
-        times_prop = times_fine[::sample_rate]
-        states_prop = states_fine[::sample_rate]
-        densities_prop = [densities_fine[i] for i in range(0, len(densities_fine), sample_rate)]
-        
-        logger.debug(f"File {file_id_str}: Building propagated DataFrame...")
-        rows = []
-        for t, state, dens in zip(times_prop, states_prop, densities_prop):
-            r = state[0:3]
-            lat_val, lon_val, alt_val = eci_to_lla(r, t)
-            rows.append({
-                "Timestamp": t,
-                "Altitude (km)": alt_val,
-                "MSIS Density (kg/m^3)": dens,
-                "Latitude (deg)": lat_val,
-                "Longitude (deg)": lon_val,
-            })
-        propagated_df = pd.DataFrame(rows)
-        if "log_Altitude" not in propagated_df.columns:
-            propagated_df["log_Altitude"] = np.log10(propagated_df["Altitude (km)"])
-        
-        logger.debug(f"File {file_id_str}: Running model prediction over propagated data...")
-        pred_timestamps, predicted_densities = predict_from_dataframe(
-            propagated_df, model, seq_len, selected_feature_columns, epsilon,
-            scaling_params, y_mean, y_std, target_factor
-        )
+def write_json(path: Path, chunk: Dict[str, Dict], lock: Path):
+    with FileLock(str(lock)):
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data.update(chunk); path.write_text(json.dumps(data))
 
-        result_dict = {str(file_id): {"Timestamp": pred_timestamps,
-                                      "Orbit Mean Density (kg/m^3)": predicted_densities}}
-        process_file_end_time = time.time()
-        logger.info(f"File {file_id_str}: Result saved. Time: {process_file_end_time - process_file_start_time:.3f} [s]")
-        #plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine)
-        return result_dict
-    except Exception as e:
-        logger.error(f"Error processing file ID {file_id:05d}: {e}")
-        return {str(file_id): {"error": str(e)}}
-
-# ---------------------------
-# Plotting function (unchanged)
-# ---------------------------
-def plot_orbit_density(file_id, result_dict, dh, times_fine, densities_fine, output_dir="./result_plots"):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    pred_timestamps = pd.to_datetime(result_dict[str(file_id)]["Timestamp"])
-    pred_density = result_dict[str(file_id)]["Orbit Mean Density (kg/m^3)"]
-    truth_df = dh.read_csv_data(file_id, dh.sat_density_folder)
-    truth_df = truth_df[truth_df["Orbit Mean Density (kg/m^3)"] != 9.99e+32]
-    truth_df["Timestamp"] = pd.to_datetime(truth_df["Timestamp"])
-    fig, ax = plt.subplots(figsize=(19.2, 10.8), dpi=100)
-    ax.plot(times_fine, densities_fine, label="MSIS Orbit Mean Density", linewidth=2)
-    ax.plot(pred_timestamps, pred_density, label="Predicted Orbit Mean Density", linewidth=2)
-    ax.plot(truth_df["Timestamp"], truth_df["Orbit Mean Density (kg/m^3)"],
-            label="Truth Orbit Mean Density", linewidth=2)
-    ax.set_xlabel("Timestamp", fontsize=14)
-    ax.set_ylabel("Orbit Mean Density (kg/m^3)", fontsize=14)
-    ax.set_title("Orbit Mean Density vs Time", fontsize=16)
-    ax.legend(fontsize=12)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    output_file = output_dir / f"{file_id}.png"
-    plt.savefig(str(output_file))
-    plt.close(fig)
-
-# ---------------------------
-# Main Pipeline
-# ---------------------------
+# ─────────────────────────────── main ──────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run simulation propagation and model prediction pipeline."
-    )
-    parser.add_argument("--single_process", action="store_true",
-                        help="Run sequentially; default is multiprocessing.")
-    args = parser.parse_args()
-    
-    os.environ["MSIS_DATA_DIR"] = "/app/ingested_program/src/msis2.0"
-    
-    DATA_PATHS = {
-        "omni2_folder": Path("/app/data/dataset/test/omni2"),
-        "initial_state_file": Path("/app/input_data/initial_states.csv"),
-        "sat_density_folder": None,
-        "forcasted_omni2_folder": Path("/app/data/dataset/test/forcasted_omni2"),
-        "sat_density_omni_forcasted_folder": Path("/app/data/dataset/test/sat_density_omni_forcasted"),
-        "sat_density_omni_propagated_folder": Path("/app/data/dataset/test/sat_density_omni_propagated"),
-    }
-    
-    seq_len = 10
-    SELECTED_FEATURE_COLUMNS = ["MSIS Density (kg/m^3)", "Latitude (deg)", "Longitude (deg)", "log_Altitude"]
-    EPSILON = 1e-8
-    # Load scaling parameters saved during training.
-    scaling_file = Path("scaling_params.json")
-    if scaling_file.exists():
-        with open(scaling_file, "r") as f:
-            scaling_params = json.load(f)
-        # Expect the JSON to have keys "X_mean", "X_std", "y_mean", "y_std", "target_factor"
-        y_mean = np.array(scaling_params["y_mean"])
-        y_std = np.array(scaling_params["y_std"])
-        target_factor = scaling_params["target_factor"]
-    else:
-        scaling_params = None
-        y_mean = np.array([0.0])
-        y_std = np.array([1.0])
-        target_factor = 1e-12
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["train","predict"], default="predict")
+    p.add_argument("--local", action="store_true")
+    p.add_argument("--checkpoint", type=Path, default=Path("density_net.pt"))
+    p.add_argument("--subset_pct", type=float, default=1.0)
+    p.add_argument("--epochs", type=int, default=120)
+    p.add_argument("--patience", type=int, default=16)
+    p.add_argument("--plot", action="store_true")
+    p.add_argument("--plot_file", type=str)
+    p.add_argument("--chunk", type=int, default=50)
+    args = p.parse_args()
 
-    dt_integ = 30.0
-    total_seconds = 3 * 86400   # 3 days propagation
-    steps_integ = int(total_seconds / dt_integ)
-    sample_rate = int(600 / dt_integ)
-    PROPAGATION_PARAMS = {
-        "dt_integ": dt_integ,
-        "steps_integ": steps_integ,
-        "mass": 100.0,
-        "Cd": 2.2,
-        "A": 1.0,
-        "sample_rate": sample_rate
-    }
-    
-    MODEL_PATH = Path("density_prediction_patchtst_model.pth")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PatchTST(seq_len=seq_len, patch_size=2, num_features=len(SELECTED_FEATURE_COLUMNS),
-                      d_model=128, nhead=4, num_layers=3)
-    model.to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval()
-    
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    logger = logging.getLogger("Main")
-    
-    dh = DataHandler(logger, **DATA_PATHS)
-    file_ids = dh.initial_states["File ID"].unique().tolist()
-    total_files = len(file_ids)
-    logger.info(f"Found {total_files} file IDs to process.")
-    
-    output_path = Path("/app/output/prediction.json")
-    output_dict = {}
-    processed_count = 0
-    start_time = time.time()
-    logger.info("TIMEOUT TIMER STARTED")
-    TIMEOUT = 7000  # seconds
-    
-    if not args.single_process:
-        workers = max(4, os.cpu_count())
-        logger.info(f"Running in multiprocessing mode using {workers} worker processes.")
-        with multiprocessing.Pool(workers) as pool:
-            func = partial(process_file, dh=dh, model=model, seq_len=seq_len,
-                           selected_feature_columns=SELECTED_FEATURE_COLUMNS,
-                           epsilon=EPSILON, scaling_params=scaling_params,
-                           propagation_params=PROPAGATION_PARAMS,
-                           y_mean=y_mean, y_std=y_std, target_factor=target_factor)
-            for res in pool.imap_unordered(func, file_ids):
-                output_dict.update(res)
-                processed_count += 1
-                logger.info(f"Processed {processed_count}/{total_files} files.")
-                if time.time() - start_time > TIMEOUT:
-                    logger.info("Overall runtime exceeded TIMEOUT. Terminating further processing.")
-                    break
+    if args.local:
+        OUT_JSON = "prediction.json"
+        DATA = dict(
+            omni2_folder=Path("./data/omni2"),
+            initial_state_folder=Path("./data/initial_state"),
+            sat_density_folder=Path("./data/sat_density"),
+            forcasted_omni2_folder=Path("./data/forcasted_omni2"),
+            sat_density_omni_forcasted_folder=Path("./data/sat_density_omni_forcasted"),
+            sat_density_omni_propagated_folder=Path("./data/sat_density_omni_propagated"))
     else:
-        logger.info("Running in sequential mode.")
-        for file_id in file_ids:
-            res = process_file(file_id, dh, model, seq_len, SELECTED_FEATURE_COLUMNS,
-                               EPSILON, scaling_params, PROPAGATION_PARAMS,
-                               y_mean, y_std, target_factor)
-            output_dict.update(res)
-            processed_count += 1
-            logger.info(f"Processed {processed_count}/{total_files} files sequentially.")
-            if time.time() - start_time > TIMEOUT:
-                logger.info(f"Overall runtime exceeded TIMEOUT ({TIMEOUT} [s]). Terminating further processing.")
-                break
+        OUT_JSON = "/app/output/prediction.json"
+        DATA = dict(
+            omni2_folder=Path("/app/data/dataset/test/omni2"),
+            initial_state_file=Path("/app/input_data/initial_states.csv"),
+            sat_density_folder=None,
+            forcasted_omni2_folder=Path("/app/data/dataset/test/forcasted_omni2"),
+            sat_density_omni_forcasted_folder=Path("/app/data/dataset/test/sat_density_omni_forcasted"),
+            sat_density_omni_propagated_folder=Path("/app/data/dataset/test/sat_density_omni_propagated"))
 
-    # Write all results to the JSON file only once.
-    with open(output_path, "w") as f:
-        json.dump(output_dict, f, indent=4)
-    logger.info(f"Prediction JSON saved to {output_path}")
+    dh = DataHandler(logging.getLogger(__name__), **DATA)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    if args.mode == "train":
+        ids = sorted(dh.get_all_file_ids_from_folder(dh.sat_density_folder))
+        if args.subset_pct < 1.0:
+            k = max(1, int(len(ids)*args.subset_pct)); ids = random.sample(ids, k)
+        logging.info(f"Training on {len(ids)} samples"); train(ids, dh, args.checkpoint,
+                                                               epochs=args.epochs, patience=args.patience, device=device)
+    else:
+        net, sx, sy = load_net(args.checkpoint, device)
+        if args.plot:
+            if not args.plot_file: raise ValueError("--plot_file required with --plot")
+            plot_file(args.plot_file, predict_one(args.plot_file, dh, net, sx, sy, device), dh)
+        else:
+            ids = dh.initial_states["File ID"].unique().tolist()
+            if args.subset_pct < 1.0:
+                k = max(1,int(len(ids)*args.subset_pct)); ids = random.sample(ids,k)
+            out, lock = Path(OUT_JSON), Path(f"{OUT_JSON}.lock")
+            total = math.ceil(len(ids)/args.chunk)
+            for b,i in enumerate(range(0,len(ids),args.chunk),1):
+                tic = time.time()
+                batch = ids[i:i+args.chunk]
+                logging.info(f"Batch {b}/{total}: {batch[0]} … {batch[-1]} (n={len(batch)})")
+                chunk = {fid: predict_one(fid, dh, net, sx, sy, device) for fid in batch}
+                write_json(out, chunk, lock)
+                logging.info(f"Batch {b} finished in {time.time()-tic:.2f}s")
+            logging.info(f"Predictions written → {out}")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     main()

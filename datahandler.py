@@ -121,7 +121,7 @@ class DataHandler:
         Returns:
             pd.Series: The initial state data for the specified file ID.
         """
-        return self.initial_states[self.initial_states["File ID"] == file_id].iloc[0]
+        return self.initial_states[self.initial_states["File ID"] == int(file_id)].iloc[0]
 
     def read_csv_data(self, file_id: int, folder: Path) -> pd.DataFrame:
         """
@@ -137,6 +137,8 @@ class DataHandler:
         Raises:
             FileNotFoundError: If the CSV file for the specified file ID is not found.
         """
+        if isinstance(file_id, str):
+            file_id = int(file_id)
         file_id_str = f"{file_id:05d}"
         for file in folder.iterdir():
             if file.suffix == ".csv" and file_id_str in file.stem:
@@ -147,7 +149,7 @@ class DataHandler:
                 return data
         raise FileNotFoundError(f"{folder.stem} data for File ID {file_id} not found.")
 
-    def save_df_from_copy_folder_path(self, file_id: int, df: pd.DataFrame, copy_folder: Path, dest_folder: Path) -> None:
+    def save_df_from_copy_folder_path(self, file_id: int, df: pd.DataFrame, copy_folder: Path, dest_folder: Path, just_return_filename: bool = False) -> None:
         """
         Saves a DataFrame to a destination folder, using the filename from a copy folder.
 
@@ -170,6 +172,8 @@ class DataHandler:
             raise FileNotFoundError(f"Could not locate forecast file for File ID {file_id}")
 
         output_path = dest_folder / output_file
+        if just_return_filename:
+            return output_path
         df.to_csv(output_path, index=False)
         self.logger.info(f"Result saved to {output_path} for file ID {file_id}.")
 
