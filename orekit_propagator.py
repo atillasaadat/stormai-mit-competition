@@ -47,6 +47,53 @@ from math import radians
 orekit.initVM()
 setup_orekit_curdir(from_pip_library=False)
 
+import sys
+import karman
+import pandas as pd
+import torch
+import numpy as np
+import random
+from torch.utils.data import RandomSampler, SequentialSampler
+import pickle as pk
+import matplotlib.pyplot as plt
+import math
+from sklearn.preprocessing import QuantileTransformer
+import argparse
+from density_models import ForecastingModel
+
+import numpy as np
+
+torch.set_default_dtype(torch.float32)
+
+class Karman():
+    def __init__(self):
+        with open("ts_data_normalized.pk", "rb") as f:
+            self.ts_data_normalized = pk.load(f)
+        #model_path_ts = "ts_karman_model_tft_ss16_heads5_lag10000_resolution100_valid_mape_17.546_params_82289.torch"
+        model_path_ts = 'ts_karman_model_tft_ss32_heads5_lag10000_resolution100_valid_mape_15.906_params_289457.torch'
+        self.forecasting_model=ForecastingModel(state_size=32,attention_heads=5)
+        self.forecasting_model.load_model(model_path=model_path_ts,device='cuda')
+
+    def get_density(self, date, lat, lon, alt_km):
+        #let's prepare the inputs to the model and run it:
+        longitudes = [lon, 0]
+        latitudes = [lat, 0]
+        n_samples = len(longitudes)
+        altitudes = [alt_km * 1e3, 300] # random 2nd index alt
+        #dates=['2024-05-31 23:00:00']*n_samples
+        dates = [date]*2
+
+        density_nn = self.forecasting_model(dates=dates, 
+                                    altitudes=altitudes,
+                                    longitudes=longitudes,
+                                    latitudes=latitudes,
+                                    device=torch.device('cuda'),
+                                    ts_data_normalized=self.ts_data_normalized,
+                                    )
+
+        return float(density_nn[0])
+        
+
 # =============================================================================
 # Orbit Propagation Class
 # =============================================================================
@@ -189,6 +236,7 @@ class PersistenceMSIS:
         self.logger = logger
         self.all_space_weather_data = all_space_weather_data
         self.predict_to_space_weather = predict_to_space_weather
+        self.karman = Karman()
 
     def run(self, dt, lon, lat, alt):
         index = (self.all_space_weather_data["Timestamp"] - dt).abs().idxmin()
@@ -202,19 +250,21 @@ class PersistenceMSIS:
 
         try:
             # Use single list wrappers to ensure consistent dimensions
-            result = msis.run(
-                dates=[dt],
-                lons=[lon],
-                lats=[lat],
-                alts=[alt],
-                f107s=[f107_daily],
-                aps=[aps],
-            )
+            #from IPython import embed; embed(); quit()
+            density = self.karman.get_density(str(dt), lat, lon, alt_km=alt)
+            # result = msis.run(
+            #     dates=[dt],
+            #     lons=[lon],
+            #     lats=[lat],
+            #     alts=[alt],
+            #     f107s=[f107_daily],
+            #     aps=[aps],
+            # )
         except Exception as e:
             logger.error(f"Error running MSIS: {e}")
             raise Exception(f"MSIS run failed for date {dt}, lon={lon}, lat={lat}, alt={alt}: {e}") from e
 
-        density = result[0, 0]
+        #density = result[0, 0]
         self.logger.debug(
             f"Running MSIS for {dt} at lon={lon}, lat={lat}, alt={alt}, Ap: {aps}, f107={f107_daily}, density: {density}"
         )
@@ -595,15 +645,24 @@ def process_file(file_id):
         return f"[{file_id}] ERROR"
 
     
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Process orbit data with optional multiprocessing.")
+    parser.add_argument("--multiprocess",
+                        action="store_true",
+                        help="Enable multiprocessing. Otherwise run in single-process mode.")
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = parse_arguments()
     multiprocessing.freeze_support()  # Required for Windows
 
     # Configure logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
 
-    # Define OVERWRITE flag and configuration inside __main__
-    OVERWRITE = True  # Set to False to skip processing if output file exists
+    # Define OVERWRITE flag
+    OVERWRITE = True  # or read from args if you wish
 
     # Satellite and force model parameters
     sat_config = {
@@ -639,25 +698,47 @@ if __name__ == "__main__":
     total_files = len(all_file_ids)
     logger.info(f"Total files to process: {total_files}, [{all_file_ids[0]} - {all_file_ids[-1]}]")
 
-    # Use multiprocessing Pool to process each file_id in parallel.
-    workers = max(4, os.cpu_count() - 1)
-    logger.info(f"Using {workers} worker processes for parallel processing.")
+    if args.multiprocess:
+        # -------------------------------
+        # Multiprocessing mode
+        # -------------------------------
+        workers = max(4, os.cpu_count() - 10)
+        logger.info(f"Using {workers} worker processes for parallel processing.")
 
-    with multiprocessing.Manager() as manager:
-        shared_counter = manager.Value("i", 0)
-        lock = manager.Lock()
+        # Use a Manager if you need shared state/counter
+        with multiprocessing.Manager() as manager:
+            shared_counter = manager.Value("i", 0)
+            lock = manager.Lock()
 
-        # Set the multiprocessing start method to "spawn" for clean process creation.
-        multiprocessing.set_start_method("spawn", force=True)
+            # For Windows: set_start_method("spawn") once, or check if not already set
+            multiprocessing.set_start_method("spawn", force=True)
 
-        with multiprocessing.Pool(
-            workers,
-            initializer=pool_init,
-            initargs=(shared_counter, lock, data_paths, sat_config, sim_config, OVERWRITE, total_files)
-        ) as pool:
-            results = pool.map(process_file, all_file_ids)
+            with multiprocessing.Pool(
+                workers,
+                initializer=pool_init,
+                initargs=(shared_counter, lock, data_paths, sat_config, sim_config, OVERWRITE, total_files)
+            ) as pool:
+                results = pool.map(process_file, all_file_ids)
 
-        for result in results:
+            for result in results:
+                logger.info(result)
+
+    else:
+        # -------------------------------
+        # Single-process mode
+        # -------------------------------
+        logger.info("Running in single-process mode.")
+        # If your `process_file` needs the same init logic as `pool_init`,
+        # you can directly call pool_init here:
+        shared_counter = 0
+        lock = None
+        # or replicate pool_init steps:
+        # pool_init(shared_counter, lock, data_paths, sat_config, sim_config, OVERWRITE, total_files)
+
+        results = []
+        for file_id in all_file_ids:
+            result = process_file(file_id)
+            results.append(result)
             logger.info(result)
 
     logger.info("Simulation complete.")

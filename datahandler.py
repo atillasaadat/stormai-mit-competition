@@ -139,11 +139,11 @@ class DataHandler:
         """
         if isinstance(file_id, str):
             file_id = int(file_id)
-        file_id_str = f"{file_id:05d}"
-        for file in folder.iterdir():
-            if file.suffix == ".csv" and file_id_str in file.stem:
-                self.logger.debug(f"Reading {folder.stem} data for File ID {file_id_str}.")
-                data = pd.read_csv(file)
+        file_id_str = f"-{file_id:05d}"
+        for csv_file in folder.iterdir():
+            if csv_file.suffix == ".csv" and file_id_str in csv_file.stem:
+                self.logger.debug(f"Reading {csv_file} data for File ID {file_id_str}.")
+                data = pd.read_csv(csv_file)
                 data = data.sort_values(by="Timestamp").reset_index(drop=True)
                 data["Timestamp"] = pd.to_datetime(data["Timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
                 return data
