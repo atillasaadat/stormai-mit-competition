@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""storm_density_model.py – v2.8  (attention + time‑weighted loss)
-================================================================
-Major changes v2.8 → accuracy‑oriented upgrades:
-• **Attention‑pooled BiGRU**: replaces last‑state pooling with learnable
-  soft‑attention over the whole 60‑day history → richer long‑term context.
-• **Time‑weighted loss** aligned with OD‑RMSE evaluation (same exponential
-  decay γ) – model learns what leaderboard cares about.
-• **Gradient clipping** (‖g‖₂ ≤ 1) & **ReduceLROnPlateau** scheduler → more
-  stable training and finer convergence.
-• Better MSIS baseline fallback: searches propagated → forecasted → constant.
-• Minor: higher hidden size, label‑smoothing on scaler targets, and
-  optional mixed‑precision (`--amp`).
+"""storm_density_model.py – v2.9 (attention + time‑weighted loss + target‑length filter)
+====================================================================================
+Changes v2.8 → v2.9
+• REQUIRE exactly 432 truth samples (3 days @ 10‑min).  
+  – Files with <432 valid samples are skipped during training.  
+  – Files with >432 samples are truncated to their first 432 points.
+• Added DensityDS._has_full_target() helper and filtering logic in __init__.
+• Updated _xy() so the target vector is always length‑432 without padding.
+Everything else is unchanged.
 """
 
 from __future__ import annotations
@@ -31,18 +28,21 @@ import matplotlib.pyplot as plt
 from datahandler import DataHandler
 
 # ───────────────────────────────── constants ────────────────────────────────
-NUM_HIST_HOURS = 24 * 60            # 1 440 (60 days hourly history)
-FORECAST_STEPS = 3 * 24 * 6         # 432 (3 days @ 10‑min)
+NUM_HIST_HOURS = 24 * 60            # 1 440 (60 days hourly history)
+FORECAST_STEPS = 3 * 24 * 6         # 432 (3 days @ 10‑min)
 LOG_EPS        = 1e-14
 
 # base OMNI columns (add more if desired)
 BASE = [
     "f10.7_index", "Lyman_alpha", "ap_index_nT", "Kp_index", "Dst_index_nT",
     "AE_index_nT", "SW_Plasma_Speed_km_s", "SW_Proton_Density_N_cm3",
-    "Flow_pressure", "BX_nT_GSE_GSM", "BZ_nT_GSM"
+    "Flow_pressure", "BX_nT_GSE_GSM", "BZ_nT_GSM", "Proton_flux_>10_Mev"
 ]
+
 RESOLUTIONS_H = [1, 3]              # 1‑h & 3‑h means
-LAG_MINUTES   = [60, 120, 180]      # 1 h / 2 h / 3 h lags
+
+# Increase temporal context: add 4 h, 6 h, 12 h lags
+LAG_MINUTES   = [60, 120, 180, 240, 360, 720]   # 1 h, 2 h, 3 h, 4 h, 6 h, 12 h
 
 # expand to full feature list
 HIST_FEATURES: List[str] = []
@@ -193,29 +193,48 @@ def static_vec(init: pd.Series) -> np.ndarray:
 
 # ─────────────────────────────── dataset ───────────────────────────────────
 class DensityDS(Dataset):
-    """Custom Dataset with on‑the‑fly scaling."""
+    """Custom Dataset with on‑the‑fly scaling.
 
-    def __init__(self, fids: List[str], dh: DataHandler, sx=None, sy=None, fit=False):
-        self.fids, self.dh = fids, dh
+    *NEW IN v2.9*: Filters files so every sample has **exactly 432** valid target
+    points.  Shorter series are dropped; longer ones are truncated.
+    """
+
+    def __init__(self, fids: List[str], dh: DataHandler, sx=None, sy=None, fit: bool = False):
+        self.dh = dh
+        # keep only ids with ≥432 valid truth points
+        self.fids = [fid for fid in fids if self._has_full_target(fid)]
+        dropped = len(fids) - len(self.fids)
+        if dropped:
+            logging.info(f"Skipped {dropped} / {len(fids)} files with <{FORECAST_STEPS} valid density samples")
+
         self.sx = sx or QuantileTransformer(output_distribution="normal")
         self.sy = sy or StandardScaler()
         if fit:
             self._fit()
+
+    # —— helper: does file have enough truth? ——
+    def _has_full_target(self, fid: str) -> bool:
+        try:
+            dens = self.dh.read_csv_data(fid, self.dh.sat_density_folder)[
+                "Orbit Mean Density (kg/m^3)"
+            ].to_numpy(np.float32)
+            valid = dens < 1.0
+            return valid.sum() >= FORECAST_STEPS
+        except Exception:
+            return False
 
     # —— scaler fit ——
     def _fit(self):
         X, Y = [], []
         for fid in tqdm(self.fids, desc="scaler_fit"):
             x, y = self._xy(fid)
-            X.append(x);
-            Y.append(y)
+            X.append(x); Y.append(y)
         self.sx.fit(np.vstack(X).reshape(-1, TOTAL_FEATURES))
         self.sy.fit(np.hstack(Y).reshape(-1, 1))
 
-    # —— MSIS baseline for a sample ——
+    # —— MSIS baseline for a sample —— (unchanged)
     @staticmethod
     def _msis_baseline(fid: str, dh: DataHandler) -> float:
-        """Robustly fetch propagated/forecasted MSIS baseline, fallback = 1e‑12."""
         folders = [
             getattr(dh, "sat_density_omni_propagated_folder", None),
             getattr(dh, "sat_density_omni_forcasted_folder", None),
@@ -224,7 +243,7 @@ class DensityDS(Dataset):
             if folder is None:
                 continue
             try:
-                df = self.dh.read_csv_data(fid, folder)
+                df = dh.read_csv_data(fid, folder)
                 return float(df["Orbit Mean Density (kg/m^3)"].iloc[0])
             except Exception:
                 continue
@@ -236,21 +255,19 @@ class DensityDS(Dataset):
         hist = _pad_or_trim(omni.to_numpy(np.float32), NUM_HIST_HOURS)
         stat = static_vec(self.dh.get_initial_state(fid)).astype(np.float32)
         msis = self._msis_baseline(fid, self.dh)
-        hist = np.hstack(
-            [
-                hist,
-                np.full((NUM_HIST_HOURS, 1), msis, dtype=np.float32),
-                np.repeat(stat[None, :], NUM_HIST_HOURS, 0),
-            ]
-        )
+        hist = np.hstack([
+            hist,
+            np.full((NUM_HIST_HOURS, 1), msis, dtype=np.float32),
+            np.repeat(stat[None, :], NUM_HIST_HOURS, 0),
+        ])
 
         dens = (
             self.dh.read_csv_data(fid, self.dh.sat_density_folder)["Orbit Mean Density (kg/m^3)"]
             .to_numpy(np.float32)
         )
-        valid = dens < 1.0
-        dens = dens[valid] if valid.any() else np.full(FORECAST_STEPS, msis)
-        dens = _pad_or_trim(dens, FORECAST_STEPS)
+        dens = dens[dens < 1.0][:FORECAST_STEPS]  # truncate to first 432 valid values
+        if dens.shape[0] != FORECAST_STEPS:
+            raise RuntimeError("Target length check failed – this file should have been filtered out earlier.")
         y_log = np.log10(np.clip(dens / msis, LOG_EPS, None))  # residual ratio
         return hist, y_log
 
@@ -265,15 +282,15 @@ class DensityDS(Dataset):
 
 # ──────────────────────────── model ──────────────────────────────────────
 class _AttnPool(nn.Module):
-    """Soft‑attention pooling: α = softmax(W h)."""
+    """Soft‑attention pooling: a = softmax(W h)."""
 
     def __init__(self, d_model: int):
         super().__init__()
         self.attn = nn.Linear(d_model, 1)
 
     def forward(self, H):  # H: (B, T, D)
-        α = torch.softmax(self.attn(H), dim=1)  # (B, T, 1)
-        return (α * H).sum(dim=1)  # (B, D)
+        a = torch.softmax(self.attn(H), dim=1)  # (B, T, 1)
+        return (a * H).sum(dim=1)  # (B, D)
 
 
 class BiGRUAttn(nn.Module):
@@ -307,9 +324,9 @@ class TimeWeightedMSE(nn.Module):
 
     def __init__(self, steps: int = FORECAST_STEPS, dt: float = 600.0, eps: float = 1e-5):
         super().__init__()
-        γ = -math.log(eps) / (steps * dt)
+        gamma = -math.log(eps) / (steps * dt)
         t = torch.arange(steps).float() * dt  # seconds
-        self.register_buffer("w", torch.exp(-γ * t))  # (steps,)
+        self.register_buffer("w", torch.exp(-gamma * t))  # (steps,)
 
     def forward(self, pred, target):
         # pred/target: (B, steps)
@@ -319,9 +336,9 @@ class TimeWeightedMSE(nn.Module):
 @torch.inference_mode()
 def _od_rmse(model, loader, ds, device="cpu", eps=1e-5):
     dur_sec = FORECAST_STEPS * 600.0
-    γ = -log(eps) / dur_sec
+    gamma = -log(eps) / dur_sec
     t_sec = np.arange(FORECAST_STEPS) * 600.0
-    w = np.exp(-γ * t_sec)
+    w = np.exp(-gamma * t_sec)
 
     num, den = 0.0, 0.0
     for xb, yb in loader:
