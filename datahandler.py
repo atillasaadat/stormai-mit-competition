@@ -1,221 +1,152 @@
 """
 datahandler.py
+==============
 
-This module contains the DataHandler class, which is responsible for handling file I/O operations
-related to initial state, OMNI, and density data. The class provides methods to read, process, and
-save data from various folders.
+A small utility for reading *initial‑state*, *OMNI2*, and *orbit‑mean‑density*
+CSV files organised in numbered‑ID filenames such as:
 
-Classes:
-    DataHandler: Handles file I/O for initial state, OMNI, and density data.
+    omni2‑20250601‑00042.csv
+    sat_density‑…‑00042‑truth.csv
 
-Usage Example:
-    import logging
-    from pathlib import Path
-    from datahandler import DataHandler
+The 5‑digit “file ID” is parsed from the stem.  The same ID is used to locate
+the matching row in the initial‑state table.
 
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    logger = logging.getLogger(__name__)
+Typical usage
+-------------
 
-    # Initialize DataHandler with an initial state file:
-    DATA_PATHS = {
-        "omni2_folder": Path("/app/data/dataset/test/omni2"),
-        "initial_state_file": Path("/app/input_data/initial_states.csv"),
-        "sat_density_folder": Path("/app/data/dataset/test/sat_density"),
-        "forcasted_omni2_folder": Path("/app/data/dataset/test/forcasted_omni2"),
-        "sat_density_omni_forcasted_folder": Path("/app/data/dataset/test/sat_density_omni_forcasted"),
-        "sat_density_omni_propagated_folder": Path("/app/data/dataset/test/sat_density_omni_propagated"),
-    }
-    dh = DataHandler(logger, **DATA_PATHS)
-    
-    # Example usage of DataHandler methods
-    initial_state = dh.get_initial_state(file_id=1)
-    omni_data = dh.read_csv_data(file_id=1, folder=dh.omni2_folder)
-    dh.save_df_from_copy_folder_path(file_id=1, df=omni_data, copy_folder=dh.forcasted_omni2_folder, dest_folder=dh.sat_density_omni_forcasted_folder)
-    file_ids = dh.get_all_file_ids_from_folder(folder=dh.sat_density_folder)
+>>> from pathlib import Path
+>>> from datahandler import DataHandler
+>>> dh = DataHandler(
+...     omni2_folder=Path("/data/omni2"),
+...     sat_density_folder=Path("/data/sat_density"),
+...     initial_state_file=Path("/data/initial_states.csv"),
+... )
+>>> init = dh.get_initial_state(42)
+>>> omni = dh.read_csv_data(42, dh.omni2_folder)
 """
 
-import pandas as pd
-from pathlib import Path
+from __future__ import annotations
+
 import logging
 import re
+from pathlib import Path
+from typing import List
 
-# =============================================================================
-# DataHandler Class
-# =============================================================================
+import pandas as pd
+
+_LOGGER = logging.getLogger(__name__)         # module‑level fallback logger
+_ID_PATTERN = re.compile(r"-(\d{5})-")        # matches "-01234-" in filename
+
+
 class DataHandler:
-    """
-    Handles file I/O for initial state, OMNI, and density data.
-    """
+    """Lightweight façade around CSV I/O for the STORM‑AI data layout."""
 
+    # --------------------------------------------------------------------- #
+    # construction / initial‑state loading
+    # --------------------------------------------------------------------- #
     def __init__(
-        self, logger,
-        omni2_folder,
-        sat_density_folder,
-        forcasted_omni2_folder,
-        sat_density_omni_forcasted_folder,
-        sat_density_omni_propagated_folder,
-        initial_state_folder=None,
-        initial_state_file=None,
-    ):
-        """
-        Initializes the DataHandler with the specified folders and logger.
-
-        Args:
-            logger (logging.Logger): Logger for logging messages.
-            omni2_folder (Path): Path to the OMNI2 data folder.
-            initial_state_folder (Path, optional): Path to the initial state data folder.
-            initial_state_file (Path, optional): Path to the initial state CSV file.
-            sat_density_folder (Path): Path to the satellite density data folder.
-            forcasted_omni2_folder (Path): Path to the forecasted OMNI2 data folder.
-            sat_density_omni_forcasted_folder (Path): Path to the forecasted satellite density OMNI data folder.
-            sat_density_omni_propagated_folder (Path): Path to the propagated satellite density OMNI data folder.
-        """
-        self.logger = logger
+        self,
+        *,
+        omni2_folder: Path,
+        sat_density_folder: Path,
+        initial_state_file: Path | None = None,
+        initial_state_folder: Path | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.logger = logger or _LOGGER
         self.omni2_folder = omni2_folder
         self.sat_density_folder = sat_density_folder
-        self.forcasted_omni2_folder = forcasted_omni2_folder
-        self.sat_density_omni_forcasted_folder = sat_density_omni_forcasted_folder
-        self.sat_density_omni_propagated_folder = sat_density_omni_propagated_folder
-        
-        # Use initial_state_file if provided; otherwise, use initial_state_folder.
-        if initial_state_file is not None:
-            self.initial_state_file = initial_state_file
-            self.initial_state_folder = None
-        else:
-            self.initial_state_folder = initial_state_folder
-            self.initial_state_file = None
 
-        self.__read_initial_states()
+        if initial_state_file and initial_state_folder:
+            raise ValueError("Provide *either* initial_state_file or folder, not both.")
 
-    def __read_initial_states(self) -> None:
+        self._initial_state_src = initial_state_file or initial_state_folder
+        if self._initial_state_src is None:
+            raise ValueError("Must supply initial_state_file or initial_state_folder")
+
+        self.initial_states: pd.DataFrame = self._load_initial_states()
+        if self.initial_states.empty:
+            raise RuntimeError("Initial‑state table is empty — check your path.")
+
+        self.logger.info(
+            "DataHandler ready: %d initial states, OMNI2=%s, rho=%s",
+            len(self.initial_states), omni2_folder, sat_density_folder
+        )
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def get_initial_state(self, file_id: int | str) -> pd.Series:
+        """Return the *single* initial‑state row for `file_id`."""
+        fid = int(file_id)
+        row = self.initial_states[self.initial_states["File ID"] == fid]
+        if row.empty:
+            raise KeyError(f"Initial state for File ID {fid} not found.")
+        return row.iloc[0]
+
+    def read_csv_data(self, file_id: int | str, folder: Path) -> pd.DataFrame:
         """
-        Reads initial state data from a single CSV file (if provided) or from all CSV files in the
-        initial_state_folder, and concatenates them into a single DataFrame.
+        Locate the CSV in *folder* whose stem contains "-<5‑digit ID>-" and
+        return it sorted by Timestamp.
         """
-        if self.initial_state_file is not None:
-            self.logger.debug(f"Loading initial states from file: {self.initial_state_file}")
-            self.initial_states = pd.read_csv(self.initial_state_file)
-        elif self.initial_state_folder is not None:
-            dataframes = []
-            for file in self.initial_state_folder.iterdir():
-                if file.suffix == ".csv":
-                    df = pd.read_csv(file)
-                    dataframes.append(df)
-            self.initial_states = pd.concat(dataframes, ignore_index=True)
-            self.logger.debug(f"Loaded initial state data from folder with {len(self.initial_states)} rows.")
-        else:
-            self.logger.error("No initial state source provided. Provide either initial_state_file or initial_state_folder.")
-            raise ValueError("No initial state source provided.")
+        path = self._find_file(int(file_id), folder)
+        self.logger.debug("Reading %s", path.name)
+        df = pd.read_csv(path, parse_dates=["Timestamp"])
+        return df.sort_values("Timestamp", ignore_index=True)
 
-    def get_initial_state(self, file_id):
+    def save_df_from_copy_folder_path(
+        self,
+        file_id: int | str,
+        df: pd.DataFrame,
+        copy_folder: Path,
+        dest_folder: Path,
+        *,
+        return_path_only: bool = False,
+    ) -> Path:
         """
-        Retrieves the initial state data for the specified file ID.
-
-        Args:
-            file_id (int): The file ID to retrieve the initial state for.
-
-        Returns:
-            pd.Series: The initial state data for the specified file ID.
+        Persist *df* to *dest_folder* using the filename copied from *copy_folder*
+        that matches `file_id`.  Returns the full output path.
         """
-        return self.initial_states[self.initial_states["File ID"] == int(file_id)].iloc[0]
+        template = self._find_file(int(file_id), copy_folder)
+        dest_path = dest_folder / template.name
+        if return_path_only:
+            return dest_path
 
-    def read_csv_data(self, file_id: int, folder: Path) -> pd.DataFrame:
-        """
-        Reads CSV data for the specified file ID from the specified folder.
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        df.to_csv(dest_path, index=False)
+        self.logger.info("Saved %s (%d rows) → %s", template.name, len(df), dest_path)
+        return dest_path
 
-        Args:
-            file_id (int): The file ID to read the data for.
-            folder (Path): The folder to read the data from.
+    def get_all_file_ids_from_folder(self, folder: Path) -> List[int]:
+        """Return every unique 5‑digit file ID present in CSV filenames."""
+        ids: set[int] = set()
+        for file in folder.glob("*.csv"):
+            if m := _ID_PATTERN.search(file.stem):
+                ids.add(int(m.group(1)))
+        return sorted(ids)
 
-        Returns:
-            pd.DataFrame: The data read from the CSV file.
+    # ------------------------------------------------------------------ #
+    # internal helpers
+    # ------------------------------------------------------------------ #
+    def _load_initial_states(self) -> pd.DataFrame:
+        """Load and concatenate initial‑state CSVs from file or directory."""
+        src = self._initial_state_src
+        if isinstance(src, Path) and src.is_file():
+            self.logger.debug("Loading initial states from %s", src)
+            return pd.read_csv(src)
 
-        Raises:
-            FileNotFoundError: If the CSV file for the specified file ID is not found.
-        """
-        if isinstance(file_id, str):
-            file_id = int(file_id)
-        file_id_str = f"-{file_id:05d}"
-        for csv_file in folder.iterdir():
-            if csv_file.suffix == ".csv" and file_id_str in csv_file.stem:
-                self.logger.debug(f"Reading {csv_file} data for File ID {file_id_str}.")
-                data = pd.read_csv(csv_file)
-                data = data.sort_values(by="Timestamp").reset_index(drop=True)
-                data["Timestamp"] = pd.to_datetime(data["Timestamp"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-                return data
-        raise FileNotFoundError(f"{folder.stem} data for File ID {file_id} not found.")
+        dfs: list[pd.DataFrame] = []
+        for csv_file in Path(src).glob("*.csv"):       # type: ignore[arg-type]
+            dfs.append(pd.read_csv(csv_file))
+        self.logger.debug("Loaded %d initial‑state chunk(s)", len(dfs))
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    def save_df_from_copy_folder_path(self, file_id: int, df: pd.DataFrame, copy_folder: Path, dest_folder: Path, just_return_filename: bool = False) -> None:
-        """
-        Saves a DataFrame to a destination folder, using the filename from a copy folder.
-
-        Args:
-            file_id (int): The file ID to save the data for.
-            df (pd.DataFrame): The DataFrame to save.
-            copy_folder (Path): The folder to copy the filename from.
-            dest_folder (Path): The destination folder to save the file to.
-
-        Raises:
-            FileNotFoundError: If the forecast file for the specified file ID is not found.
-        """
-        file_id_str = f"{file_id:05d}"
-        output_file = None
-        for file in copy_folder.iterdir():
-            if file.suffix == ".csv" and file_id_str in file.stem:
-                output_file = file.name
-                break
-        if output_file is None:
-            raise FileNotFoundError(f"Could not locate forecast file for File ID {file_id}")
-
-        output_path = dest_folder / output_file
-        if just_return_filename:
-            return output_path
-        df.to_csv(output_path, index=False)
-        self.logger.info(f"Result saved to {output_path} for file ID {file_id}.")
-
-    def get_all_file_ids_from_folder(self, folder: Path) -> list:
-        """
-        Retrieves all file IDs from .csv filenames in the given folder.
-        The file ID is identified as a 5-digit number surrounded by hyphens (e.g., "-12345-").
-
-        Args:
-            folder (Path): The folder to retrieve file IDs from.
-
-        Returns:
-            list: List of file IDs as integers.
-        """
-        file_ids = []
-        pattern = re.compile(r"-(\d{5})-")
-        
-        for file in folder.iterdir():
-            if file.suffix == ".csv":
-                match = pattern.search(file.stem)
-                if match:
-                    try:
-                        file_ids.append(int(match.group(1)))
-                    except ValueError:
-                        self.logger.warning(f"Invalid file ID in filename: {file.name}")
-        
-        return file_ids
-
-if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    logger = logging.getLogger(__name__)
-    
-    dh = DataHandler(logger,
-        omni2_folder = Path("./data/omni2"),
-        initial_state_folder = Path("./data/initial_state"),
-        sat_density_folder = Path("./data/sat_density"),
-        forcasted_omni2_folder = Path("./data/forcasted_omni2"),
-        sat_density_omni_forcasted_folder = Path("./data/sat_density_omni_forcasted"),
-        sat_density_omni_propagated_folder = Path("./data/sat_density_omni_propagated"),
-    )
-    from IPython import embed; embed(); quit()
+    def _find_file(self, file_id: int, folder: Path) -> Path:
+        """Return the unique CSV path in *folder* whose stem includes the ID."""
+        tag = f"-{file_id:05d}-"
+        matches = [p for p in folder.glob("*.csv") if tag in p.stem]
+        if not matches:
+            raise FileNotFoundError(f"No CSV for ID {file_id} in {folder}")
+        if len(matches) > 1:
+            raise RuntimeError(f"Multiple CSVs for ID {file_id} in {folder}: {matches}")
+        return matches[0]
