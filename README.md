@@ -1,7 +1,7 @@
 <div align="center">
 
-# STORM-AI
-**Satellite Tracking and Orbit Resilience Modeling with AI** 
+# STORM‑AI
+**Satellite Tracking and Orbit Resilience Modeling with AI**
 
 ![subtitle](https://raw.githubusercontent.com/ARCLab-MIT/STORM-AI-devkit-2025/refs/heads/main/docs/_img/subtitle.png)
 
@@ -16,7 +16,6 @@
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/dataset.html">Dataset</a> • 
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/background.html">Background</a> • 
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/faq.html">FAQ</a> 
-
 
 ---
 <div style="display: flex; justify-content: center; align-items: center; gap: 10px; padding: 10px;">
@@ -85,6 +84,149 @@ The dataset consists of a public challenge dataset that can be used to train and
 
 </div>
 
+## Quick‑start
+
+```bash
+# 1 ─ Clone and enter the repo
+git clone https://github.com/your‑fork/STORM‑AI.git && cd STORM‑AI
+
+# 2 ─ Create & activate a Python ≥3.10 virtual‑env
+python -m venv .venv                    # Windows: py -m venv .venv
+source .venv/bin/activate               # Windows: .\.venv\Scripts\activate
+
+# 3 ─ Install deps
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# 4 ─ Drop the dataset in ./data/ (see next section)
+
+# 5 ─ Train a model (≈25 min on a modern GPU, ~2 h on CPU)
+python submission.py --mode train --epochs 50 --checkpoint density_net.pt
+
+# 6 ─ Predict on all files
+python submission.py --mode predict --checkpoint density_net.pt
+````
+
+---
+
+## Environment setup
+
+| Requirement                | Notes                                                 |
+| -------------------------- | ----------------------------------------------------- |
+| **Python ≥ 3.10**          | Tested on 3.10 & 3.11                                 |
+| **PyTorch ≥ 2.2**          | GPU automatically used if `torch.cuda.is_available()` |
+| **See `requirements.txt`** | Full dependency list                                  |
+
+<details>
+<summary>Creating a fresh venv</summary>
+
+```bash
+# Unix / macOS
+python -m venv .venv
+source .venv/bin/activate
+
+# Windows (PowerShell)
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+</details>
+
+Deactivate any time with `deactivate`.
+
+---
+
+## Dataset preparation
+
+1. **Download** the public challenge dataset from the competition site
+   (direct link in the original README or from the Docs button above).
+2. **Extract** so the folder tree looks like
+
+```
+STORM‑AI/
+├─ data/
+│  ├─ omni2/            <‑ hourly & 3‑hourly space‑weather CSVs
+│  ├─ sat_density/      <‑ orbit‑mean‑density ground truth
+│  └─ initial_state/    <‑ initial Keplerian / geodetic elements
+│       └─ initial_states.csv
+└─ submission.py
+```
+
+You can override these paths at runtime by editing `Config` in `submission.py` **or** by passing absolute directories with `--omni2_folder` etc. (see `--help`).
+
+---
+
+## Script entry‑points
+
+The entire workflow lives in `submission.py`.
+
+### Training
+
+```bash
+python submission.py --mode train \
+    --checkpoint density_net.pt    \        # where to save best weights
+    --epochs 50                    \        # override defaults if desired
+    --patience 24                  \        # early‑stop patience (epochs)
+    --subset_pct 0.1                         # (optional) train on 10 % of data
+```
+
+*Output:* `density_net.pt` containing model weights **plus** the fitted feature & label scalers.
+
+### Prediction / inference
+
+```bash
+python submission.py --mode predict --checkpoint density_net.pt
+```
+
+*Creates `prediction.json`* in the submission format accepted by Codabench.
+
+**Extras**
+
+```bash
+# Plot truth vs. prediction for a single file ID
+python submission.py --mode predict --checkpoint density_net.pt --plot 00042
+
+# Speed up JSON writes on large sets (writes in chunks of 100)
+python submission.py --mode predict --chunk 100
+```
+
+---
+
+## Input tensors & folder layout
+
+| Stream                | Shape fed to network | Description                                                                  |
+| --------------------- | -------------------- | ---------------------------------------------------------------------------- |
+| **Historical OMNI‑2** | `(T=1440, F≈200)`    | 60 days of 1 h / 3 h aggregates + explicit lags on 11 solar / geomag indices |
+| **Static features**   | `(1440, 13)`         | 6 Keplerian⁄geodetic values + cyclic encodings (lon, DOY, sidereal time)     |
+| **ρ₀ normaliser**     | `(1440, 1)`          | File‑level mean density prior to stabilise logs                              |
+
+All features are concatenated horizontally (total **`F=TOTAL_FEATURES=220`**) and scaled with a `QuantileTransformer` to a unit‑Gaussian.
+
+---
+
+## Model at a glance
+
+```
+History → Bi‑GRU (3 layers, hidden=384, dropout=0.3, bidirectional)
+        → Additive Attention Pool (learned temporal weights)
+        → LayerNorm → GELU MLP head → 432‑step forecast
+```
+
+*Loss*  Time‑weighted MSE (earlier horizons weighted higher, mirroring the competition metric).
+
+*Latency* ≈ 0.5 ms/sample on an RTX 3090 Ti; <2 ms on a fast CPU.
+
+---
+
+## Folder reference
+
+```
+├─ submission.py      End‑to‑end train / predict CLI
+├─ datahandler.py     Light CSV I/O façade
+├─ README.md          ← you are here
+└─ requirements.txt   Reproducible dependency list
+```
+
 ---
 <div align="center">
 <h3> Development Toolkit </h3>
@@ -111,5 +253,3 @@ The development kit is coded in Python and includes a set of essential utility f
 </div>
 
 ---
-
-
