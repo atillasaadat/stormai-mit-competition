@@ -65,7 +65,7 @@ In 2024, solar storms have lit up the skies with stunning Auroras across the Uni
 The challenge objective is to develop cutting-edge AI algorithms for nowcasting and forecasting space weather-driven changes in atmospheric density across low earth orbit using historical space weather observations. The available phenomenology include solar and geomagnetic space weather indices, measurements of the interplanetary magnetic field, and measured solar wind parameters. Participants are provided with an existing empirical atmospheric density model and spacecraft accelerometer-derived in situ densities and are tasked with training or creating models to predict future atmospheric density values.
 </div>
 
-*Adapted from:*  [![arxiv](_img/arxiv_paper.svg)](https://arxiv.org/abs/2310.16912)
+*Adapted from:*  [![arxiv](https://raw.githubusercontent.com/ARCLab-MIT/STORM-AI-devkit-2025/refs/heads/main/docs/_img/arxiv_paper.svg)](https://arxiv.org/abs/2310.16912)
 
 
 ---
@@ -83,30 +83,6 @@ The Satellite Tracking and Orbit Resilience Modeling with AI (STORM-AI) dataset 
 The dataset consists of a public challenge dataset that can be used to train and develop AI algorithms and a private evaluation dataset of the same type and format. For valid submissions, algorithm inputs must be limited to the phenomenology and data formats present in the public training dataset, but utilizing additional phenomenology or data sources for model validation and development is allowed and encouraged.
 
 </div>
-
-## Quick‑start
-
-### NOTE: existing `density_net.pt` is the same model file use in final competition entry
-```bash
-# 1 ─ Clone and enter the repo
-git clone git@github.com:atillasaadat/stormai-mit-competition.git && cd stormai-mit-competition
-
-# 2 ─ Create & activate a Python ≥3.10 virtual‑env
-python -m venv .venv                    # Windows: py -m venv .venv
-source .venv/bin/activate               # Windows: .\.venv\Scripts\activate
-
-# 3 ─ Install deps
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-# 4 ─ Drop the dataset in ./data/ (see next section)
-
-# 5 ─ Train a model (≈25 min on a modern GPU, ~2 h on CPU)
-python submission.py --mode train --epochs 50 --checkpoint density_net.pt 
-
-# 6 ─ Predict on all files
-python submission.py --mode predict --checkpoint density_net.pt
-````
 
 ---
 
@@ -139,7 +115,7 @@ Deactivate any time with `deactivate`.
 
 ## Dataset preparation
 
-1. **Download** the public challenge dataset from the competition site
+1. **[Download](https://www.dropbox.com/scl/fo/5pq4kens2baw71p6pr1aq/AFD4xBI92ZN5CHy1cDlJp1E?rlkey=f95tcxwogoro8uel7fowm60x1&st=a091whhb&dl=0)** the public challenge dataset from the competition site
    (direct link in the original README or from the Docs button above).
 2. **Extract** so the folder tree looks like
 
@@ -154,6 +130,36 @@ STORM‑AI/
 ```
 
 You can override these paths at runtime by editing `Config` in `submission.py` **or** by passing absolute directories with `--omni2_folder` etc. (see `--help`).
+
+
+## Quick‑start
+
+### NOTE: The existing `density_net.pt` is the same model file used in the final competition entry
+
+```bash
+# 1 ─ Clone and enter the repo
+git clone git@github.com:atillasaadat/stormai-mit-competition.git && cd stormai-mit-competition
+
+# 2 ─ Create & activate a Python ≥3.10 virtual‑env
+python -m venv .venv                    # Windows: py -m venv .venv
+source .venv/bin/activate               # Windows: .\.venv\Scripts\activate
+
+# 3 ─ Install deps
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# 4 ─ Drop the dataset in ./data/ (see next section)
+
+# 5 ─ Train a model
+python submission.py --mode train --epochs 50 --checkpoint density_net.pt 
+
+# 6 ─ Predict on all files
+python submission.py --mode predict --checkpoint density_net.pt
+
+# 7 ─ Predict on a single file and plot the results
+python submission.py --mode predict --plot 1 # Example: File ID 1
+
+````
 
 ---
 
