@@ -3,11 +3,9 @@
 # STORM-AI
 **Satellite Tracking and Orbit Resilience Modeling with AI** 
 
-![subtitle](_img/subtitle.png)
+![subtitle](https://raw.githubusercontent.com/ARCLab-MIT/STORM-AI-devkit-2025/refs/heads/main/docs/_img/subtitle.png)
 
 [![License](https://img.shields.io/badge/License-MIT-921921.svg?logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/Pgo8IURPQ1RZUEUgc3ZnIFBVQkxJQyAiLS8vVzNDLy9EVEQgU1ZHIDIwMDEwOTA0Ly9FTiIKICJodHRwOi8vd3d3LnczLm9yZy9UUi8yMDAxL1JFQy1TVkctMjAwMTA5MDQvRFREL3N2ZzEwLmR0ZCI+CjxzdmcgdmVyc2lvbj0iMS4wIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciCiB3aWR0aD0iMjI1LjAwMDAwMHB0IiBoZWlnaHQ9IjIyNS4wMDAwMDBwdCIgdmlld0JveD0iMCAwIDIyNS4wMDAwMDAgMjI1LjAwMDAwMCIKIHByZXNlcnZlQXNwZWN0UmF0aW89InhNaWRZTWlkIG1lZXQiPgoKPGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMC4wMDAwMDAsMjI1LjAwMDAwMCkgc2NhbGUoMC4xMDAwMDAsLTAuMTAwMDAwKSIKZmlsbD0iIzAwMDAwMCIgc3Ryb2tlPSJub25lIj4KPHBhdGggZD0iTTEwNjAgMjI0NCBjLTQwMyAtMzAgLTc0NyAtMjUxIC05MjQgLTU5NCAtOTMgLTE4MCAtMTI2IC0zMTggLTEyNgotNTI1IDAgLTE5NyAzMyAtMzQzIDExNCAtNTA0IDc0IC0xNDggMTkzIC0yOTIgMzI1IC0zOTIgODYgLTY1IDI4NCAtMTYxIDM4NwotMTg4IDIxMiAtNTUgNDc3IC00MyA2NzQgMzAgMzcxIDEzOCA2NDMgNDYwIDcxNiA4NDYgMjUgMTM3IDE2IDM4OCAtMjAgNTA4Ci0xMDkgMzY5IC0zODcgNjU3IC03NDEgNzY4IC0xMjEgMzcgLTI5MSA1OSAtNDA1IDUxeiBtLTUwMCAtMTExOSBsMCAtMzY1IC04MAowIC04MCAwIDAgMzY1IDAgMzY1IDgwIDAgODAgMCAwIC0zNjV6IG0yNjcgMTAwIGMyIC0xNDMgMSAtMjcwIC0yIC0yODIgLTUKLTIyIC0xMSAtMjMgLTg1IC0yMyBsLTgwIDAgMCAyODUgMCAyODYgODMgLTMgODIgLTMgMiAtMjYweiBtMjYzIC0xMDAgbDAKLTM2NSAtODUgMCAtODUgMCAwIDM2NSAwIDM2NSA4NSAwIDg1IDAgMCAtMzY1eiBtMjYwIDI4MCBsMCAtODYgLTgyIDMgLTgzIDMKLTMgODMgLTMgODIgODYgMCA4NSAwIDAgLTg1eiBtNTAwIDAgbDAgLTg1IC0xOTkgMCAtMTk4IDAgLTYgNjMgYy0xMSAxMTUgLTI1CjEwNyAyMDQgMTA3IGwxOTkgMCAwIC04NXogbS01MDAgLTQxMCBsMCAtMjM1IC04NSAwIC04NSAwIDAgMjM1IDAgMjM1IDg1IDAKODUgMCAwIC0yMzV6IG0yNjAgMCBsMCAtMjM1IC04MCAwIC04MCAwIC0yIDE5OCBjLTEgMTA4IC0yIDIxMSAtMyAyMjcgMCAxNyAxCjMzIDMgMzggMiA0IDM5IDcgODMgNyBsNzkgMCAwIC0yMzV6Ii8+CjwvZz4KPC9zdmc+Cg==&labelColor=FFFFFF)]()
-[![Documentation Status](https://readthedocs.org/projects/2025-ai-challenge/badge/?version=latest)](https://2025-ai-challenge.readthedocs.io/en/latest/?badge=latest)
-
 
 
 </div>
@@ -16,23 +14,15 @@
 
 <div align="center">
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/dataset.html">Dataset</a> • 
-<a href="https://2025-ai-challenge.readthedocs.io/en/latest/installation.html">Devkit Installation</a> • 
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/background.html">Background</a> • 
-<a href="https://2025-ai-challenge.readthedocs.io/en/latest/baseline.html">Baseline Solutions</a> • 
-<a href="https://2025-ai-challenge.readthedocs.io/en/latest/submission.html">Submission Process</a> • 
-<a href="https://2025-ai-challenge.readthedocs.io/en/latest/officehours.html">Office Hours</a> • 
-<a href="https://2025-ai-challenge.readthedocs.io/en/latest/resources.html">Resources</a> • 
 <a href="https://2025-ai-challenge.readthedocs.io/en/latest/faq.html">FAQ</a> 
-
-
-
 
 
 ---
 <div style="display: flex; justify-content: center; align-items: center; gap: 10px; padding: 10px;">
   <div style="display: inline-flex; align-items: center; background-color: #4d4d4d; color: #ffffff; border-radius: 5px; padding: 5px 10px; font-family: Arial, sans-serif; font-size: 14px; text-align: center;">
       <a href="https://2025-ai-challenge.readthedocs.io/en/latest/README.html" target="_blank" style="color: #ffffff; text-decoration: none;">
-        📚 Read The Docs
+        📚 Competition Docs
       </a>
   </div>
 
@@ -49,34 +39,17 @@
       </a>
   </div>
 
-  <div style="display: inline-flex; align-items: center; background-color: #4d4d4d; color: #ffffff; border-radius: 5px; padding: 5px 10px; font-family: Arial, sans-serif; font-size: 14px; text-align: center; opacity: 0.5; cursor: not-allowed;">
+  <!-- <div style="display: inline-flex; align-items: center; background-color: #4d4d4d; color: #ffffff; border-radius: 5px; padding: 5px 10px; font-family: Arial, sans-serif; font-size: 14px; text-align: center; opacity: 0.5; cursor: not-allowed;">
       <img src="https://gist.githubusercontent.com/SSHurtado/ffd2219614f39158cff2a25d99644e08/raw/2dd8b8673032541c0d74eaf8230056fa57e2233f/arXive_icon.svg" alt="Article Icon" style="height: 20px; margin-right: 8px;"> 
       Article
-  </div>
-  <div style="display: inline-flex; align-items: center; background-color: #4d4d4d; color: #ffffff; border-radius: 5px; padding: 5px 10px; font-family: Arial, sans-serif; font-size: 14px; text-align: center;">
-    <a href="https://github.com/ARCLab-MIT/STORM-AI-devkit-2025/discussions" target="_blank" style="color: #ffffff; text-decoration: none;">
-      💬 Discussion Forum
-    </a>
-</div>
-<div style="display: inline-flex; align-items: center; background-color: #4d4d4d; color: #ffffff; border-radius: 5px; padding: 5px 10px; font-family: Arial, sans-serif; font-size: 14px; text-align: center;">
-    <a href="https://github.com/ARCLab-MIT/STORM-AI-Report-Template" target="_blank" style="color: #ffffff; text-decoration: none;">
-      🧾 Report Template
-    </a>
-</div>
+  </div> -->
 </div>
 
 </div>
 
 ---
 
-<div align="left">
 
-<div style="display: flex; flex-direction: column; background-color: #fff4e5; border-left: 6px solid #ffa500; border-radius: 4px; padding: 15px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); font-family: Arial, sans-serif;">
-    <div style="font-size: 18px; font-weight: bold; color: #ffffff; background-color: #ffa500; display: inline-block; padding: 5px 10px; border-radius: 3px; margin-bottom: 10px;">🚀  Competition Status</div>
-    <p style="font-size: 14px; margin: 0 0 10px; color: #555;">We are currently in <b>Phase 2</b> of the competition, and the deadline for code submissions has passed. Thank you to everyone who participated in the challenge through Codabench, discussion forums, office hours, and beyond. Phase 1 weighted performance scores are now available on the public leaderboard, and invitations to participate in Phase 2 were emailed to finalists on Friday, May 9th. Finalists must submit technical reports by Monday, May 26th, 11:59:59 PM EDT in order to be an eligible prize winner.</p>
-    <p style="font-size: 20px; margin: 0 0 10px; color: #555; text-align:center"><b>Have fun!</b></p>
-</div>
-</div>
 
 
 
@@ -124,82 +97,11 @@ The STORM-AI DevKit is accessible on GitHub <a href="https://github.com/ARCLab-M
 The development kit is coded in Python and includes a set of essential utility functions, tutorials, and baseline implementations designed to help participants get started with the challenge. The tutorials provide guidance on data reading, parsing, and manipulation, as well as on training, evaluating, and submitting the machine learning algorithms to the competition platform.
 </div>
 
----
-
-<div align="center">
-<h3> Prizes </h3>
-</div>
-<div align="justify">
-Throughout this challenge, we offer 10 prizes with a total value of USD 25,000 in cash and travel expenses for three presenters to share their results at a technical meeting. Here is the prize breakdown:
-
-![Prizes](_img/Prizes.png)
-
-* <b> First place*: </b> USD 10,000 in cash and a trip for one team-member to present their results at a technical meeting.
-* <b> Second place*: </b> USD 5,000 in cash and a trip for one team-member to present their results at a technical meeting.
-* <b> Third place*: </b> USD 3,000 in cash and a trip for one team-member to present their results at a technical meeting.
-* <b> Seal of Excellence (4th - 10th)*: </b> USD 1,000 in cash.
-
-  <b> *Terms and conditions: </b> Expenses for travel and accommodations may be reimbursed for one person from each of the first, second, and third place teams. Airfare is reimbursable for economy class and U.S. Flag carrier airlines only. Travelers must submit a budget for approval prior to the trip. Travelers must provide comparison airfare if their trip exceeds the bounds of one day prior to and one day following the designated trip dates. Expenses will be reimbursed after the trip is complete. Cash awards are taxable, and automatic tax withholding will be carried out for nonresidents, while a 1099 will be issued for U.S. residents. Taxes for domestic payments are subject to MIT rules. Taxes for international payments (payments to non-U.S. citizens, including human subjects and recipients of student prizes or awards) are subject to a mandatory 30 percent tax withholding per U.S. government regulations. For some international awards, a reduced cash prize must be awarded due to MIT regulations. All cash prizes will be awarded after the technical meeting. All cash awards are subject to MIT policies and any relevant government policies.
-</div>
 
 ---
 
 <div align="center">
-<h3> Challenge Timeline </h3>
-</div>
-
-![Challenge phases](_img/Challenge_phases.png)
-
-<!-- 
-| Date  | Event | 
-| ------------- | ------------- | 
-| November 15, 2024 | Warm-up phase starts. |
-| December 16, 2024 | Phase 1 of the competition starts. Submissions accepted on a rolling basis. |
-| April 21, 2025 |Phase 1 ends. Top 10 finalists are notified of advancement to Phase 2. |
-| May 19, 2025 | Phase 2 ends. Technical report deadline. |
-| June 20, 2025 | Winner announcement. |
--->
-
----
-
-<div align="center">
-<h3> Citation </h3>
-</div>
-
-<div align="left">
-
-The STORM-AI dataset contains multiple data sources and should be credited in accordance with the policies of each data provider linked in the [Dataset](https://2025-ai-challenge.readthedocs.io/en/latest/dataset.html) and [Resources](https://2025-ai-challenge.readthedocs.io/en/latest/resources.html) sections. 
-
-If you reference the 2025 AI challenge problem, please use the following citation:
-```bibtex
-@article{Briden2023,
-  year = {2023},
-  month = Sept,
-  author = {Julia Briden and Peng Mun Siew and Victor Rodriguez-Fernandez and Richard Linares},
-  title = {Transformer-based Atmospheric Density Forecasting},
-  journal = {Advanced Maui Optical and Space Surveillance (AMOS) Technologies Conference},
-  note = {Free preprint available at [https://arxiv.org/abs/2310.16912](https://arxiv.org/abs/2310.16912)}
-}
-```
-</div>
-
----
-
-<div align="center">
-<h3>Contact Us</h3>
-</div>
-
-<div align="left">
-
-You can reach the challenge organizers at ai_challenge@mit.edu.
-If you have any questions regarding the devkit, please submit them to the [devkit discussion forum](https://github.com/ARCLab-MIT/STORM-AI-devkit-2025/discussions) on GitHub.
-
-</div>
-
----
-
-<div align="center">
-<h3>Acknowledgement</h3>
+<h3>Competition Acknowledgements</h3>
 </div>
 
 <div align="center">
