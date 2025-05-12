@@ -1,4 +1,0 @@
-[run]
-branch = true
-source = pymsis
-omit = pymsis/__init__.py
