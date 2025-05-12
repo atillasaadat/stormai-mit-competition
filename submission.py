@@ -688,8 +688,6 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--mode", choices=["train", "predict"], default="predict")
-    parser.add_argument("--local", action="store_true",
-                        help="no effect (kept for backwards compat)")
     parser.add_argument("--checkpoint", type=Path,
                         default=Path("density_net.pt"))
     parser.add_argument("--subset_pct", type=float, default=1.0,

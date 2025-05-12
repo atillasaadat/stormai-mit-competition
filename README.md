@@ -86,9 +86,10 @@ The dataset consists of a public challenge dataset that can be used to train and
 
 ## Quick‑start
 
+### NOTE: existing `density_net.pt` is the same model file use in final competition entry
 ```bash
 # 1 ─ Clone and enter the repo
-git clone https://github.com/your‑fork/STORM‑AI.git && cd STORM‑AI
+git clone git@github.com:atillasaadat/stormai-mit-competition.git && cd stormai-mit-competition
 
 # 2 ─ Create & activate a Python ≥3.10 virtual‑env
 python -m venv .venv                    # Windows: py -m venv .venv
@@ -101,7 +102,7 @@ pip install -r requirements.txt
 # 4 ─ Drop the dataset in ./data/ (see next section)
 
 # 5 ─ Train a model (≈25 min on a modern GPU, ~2 h on CPU)
-python submission.py --mode train --epochs 50 --checkpoint density_net.pt
+python submission.py --mode train --epochs 50 --checkpoint density_net.pt 
 
 # 6 ─ Predict on all files
 python submission.py --mode predict --checkpoint density_net.pt

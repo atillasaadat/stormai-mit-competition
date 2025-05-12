@@ -1,0 +1,12 @@
+# Core scientific stack
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+matplotlib>=3.8
+tqdm>=4.66
+
+# DL framework
+torch>=2.2
+
+# Utilities
+filelock>=3.13
