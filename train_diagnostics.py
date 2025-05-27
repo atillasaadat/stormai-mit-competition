@@ -29,8 +29,8 @@ HIST = defaultdict(list)            # keys: 'train', 'val'; values: [rmse]
 def _style_axes(ax, title: str | None = None) -> None:
     ax.grid(True, which="major", lw=0.3, alpha=0.8)
     ax.grid(True, which="minor", lw=0.2, ls="--", alpha=0.4)
-    ax.xaxis.set_minor_locator(AutoMinorLocator())
-    ax.yaxis.set_minor_locator(AutoMinorLocator())
+    #ax.xaxis.set_minor_locator(AutoMinorLocator())
+    #ax.yaxis.set_minor_locator(AutoMinorLocator())
     if title:
         ax.set_title(title, pad=4)
 
@@ -42,9 +42,9 @@ def _plot_learning_curve(hist: dict[str, list[float]]) -> None:
     ax.set_xlabel(r"Epoch")
     ax.set_ylabel(r"RMSE $\downarrow$")
     ax.set_yscale("log")
-    ax.legend(frameon=False)
+    ax.legend(frameon=True)
     _style_axes(ax, r"Learning curve: RMSE vs. Epoch")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 def _error_vs_lead(all_pred: np.ndarray, all_true: np.ndarray) -> None:
@@ -60,12 +60,12 @@ def _error_vs_lead(all_pred: np.ndarray, all_true: np.ndarray) -> None:
     fig, ax = plt.subplots(figsize=(3.3, 2.5))
     ax.plot(t_hr, rmse,    label="RMSE")
     ax.plot(t_hr, od_rmse, label="OD-weighted RMSE")
-    ax.set_xlabel(r"Lead time [h]")
+    ax.set_xlabel(r"Lead Time [h]")
     ax.set_ylabel(r"RMSE $\downarrow$")
     ax.set_yscale("log")
     ax.legend(frameon=False)
-    _style_axes(ax, r"Prediction error vs.\ lead time")
-    fig.tight_layout()
+    _style_axes(ax, r"Prediction Error vs. Lead time")
+    #fig.tight_layout()
     plt.show()
 
 def _scatter_truth_pred(all_pred: np.ndarray, all_true: np.ndarray) -> None:
@@ -82,7 +82,7 @@ def _scatter_truth_pred(all_pred: np.ndarray, all_true: np.ndarray) -> None:
     cb = fig.colorbar(hb, pad=0.01)
     cb.set_label(r"$\log_{10}\,$(count)")
     _style_axes(ax, r"True vs.\ predicted density")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 def _residual_diags(all_pred: np.ndarray, all_true: np.ndarray) -> None:
@@ -104,7 +104,7 @@ def _residual_diags(all_pred: np.ndarray, all_true: np.ndarray) -> None:
     ax[1].set_ylabel(r"Sample quantiles")
     _style_axes(ax[1], r"QQ plot")
 
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Raw vs Cleaned density distribution ────────────────────────────
@@ -120,7 +120,7 @@ def plot_raw_clean(raw, clean):
     ax[0].set_title(r"Raw distribution", pad=4)
     ax[1].set_title(r"Cleaned distribution", pad=4)
     fig.suptitle(r"Density distribution before and after cleaning", y=1.02)
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Correlation matrix on cleaned features ──────────────────────────
@@ -134,7 +134,7 @@ def plot_corr(mat):
     _style_axes(ax, r"Feature correlation matrix")
     cb = fig.colorbar(im, fraction=0.046)
     cb.set_label(r"$\rho$")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Residual histogram by F10.7 quartile ────────────────────────────
@@ -150,7 +150,7 @@ def plot_f107_residuals(pred, truth, f107):
     ax.set_ylabel(r"PDF")
     _style_axes(ax, r"Residuals by F10.7 quartile")
     ax.legend(frameon=False)
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Representative time‑series overlay ──────────────────────────────
@@ -163,7 +163,7 @@ def plot_overlay(ts, truth, pred, n=3):
     ax.set_xlabel(r"UTC")
     ax.set_ylabel(r"$\rho$  [kg\,m$^{-3}$]")
     _style_axes(ax, r"Representative time‑series overlay")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Attention heat map (mean over validation) ───────────────────────
@@ -175,7 +175,7 @@ def plot_attn_heat(attn_w):
     cb.set_label(r"Weight")
     ax.set_xlabel(r"History step (0 = oldest)")
     _style_axes(ax, r"Mean attention weights")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 
 # ───── Calibration curve (abs residual vs pred) ────────────────────────
@@ -198,10 +198,10 @@ def plot_calibration(pred, truth, bins=20):
     ax.plot(cen, mu, marker="o")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel(r"Predicted $\rho$  [kg\,m$^{-3}$]")
-    ax.set_ylabel(r"$\mathbb{E}$  [kg\,m$^{-3}$]")
+    ax.set_xlabel(r"Predicted $\rho$ [kg m$^{-3}$]")
+    ax.set_ylabel(r"$\mathbb{E}$  [kg m$^{-3}$]")
     _style_axes(ax, r"Calibration curve")
-    fig.tight_layout()
+    #fig.tight_layout()
     plt.show()
 # ╰──────────────────────────────────────────────────────────────────────╯
 
@@ -211,10 +211,10 @@ hist = {"train": data["train_rmse"].tolist(),
         "val":   data["val_rmse"].tolist()}
 _plot_learning_curve(hist)
 _error_vs_lead(data["val_pred"], data["val_true"])
-_scatter_truth_pred(data["val_pred"], data["val_true"])
-_residual_diags(data["val_pred"], data["val_true"])
-plot_raw_clean(data["raw_hist"], data["clean_hist"])            # replace 2nd arg
-plot_corr(data["raw_hist"])
-plot_f107_residuals(data["val_pred"], data["val_true"], data["f107"])
-plot_attn_heat(data["attn_w"])
-plot_calibration(data["val_pred"], data["val_true"])
+# _scatter_truth_pred(data["val_pred"], data["val_true"])
+# _residual_diags(data["val_pred"], data["val_true"])
+# plot_raw_clean(data["raw_hist"], data["clean_hist"])            # replace 2nd arg
+# plot_corr(data["raw_hist"])
+# plot_f107_residuals(data["val_pred"], data["val_true"], data["f107"])
+# plot_attn_heat(data["attn_w"])
+#plot_calibration(data["val_pred"], data["val_true"])
