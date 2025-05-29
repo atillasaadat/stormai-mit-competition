@@ -48,8 +48,11 @@
 
 ---
 
+### 🏆 Leaderboard 🏆
 
+![subtitle](_img/leaderboard.png)
 
+---
 
 
 <div align="center">
