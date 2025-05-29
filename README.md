@@ -48,10 +48,14 @@
 
 ---
 
-### 🏆 Leaderboard 🏆
+
+<div align="center">
+
+### 🏆 Leaderboard
 
 ![subtitle](_img/leaderboard.png)
 
+</div>
 ---
 
 
