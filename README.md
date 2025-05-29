@@ -51,11 +51,12 @@
 
 <div align="center">
 
-### 🏆 Leaderboard
+### 🏆 Leaderboard 🏆
 
 ![subtitle](_img/leaderboard.png)
 
 </div>
+
 ---
 
 
